@@ -37,12 +37,9 @@ from numcodecs import Blosc
 # Visualization (Static)
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import seaborn as sns
 
 # Visualization (Interactive/GUI)
 import napari
-from magicgui import magicgui
-from qtpy.QtCore import QTimer
 
 # ==============================================================================
 # 2. CONFIGURATION & CONSTANTS

@@ -37,19 +37,9 @@ except Exception:  # pragma: no cover
 # Optional imaging / IO deps (soft imports)
 # =============================================================================
 try:
-    import tifffile  # noqa: F401
-except Exception:  # pragma: no cover
-    tifffile = None
-
-try:
     import zarr  # noqa: F401
 except Exception:  # pragma: no cover
     zarr = None
-
-try:
-    from PIL import Image  # noqa: F401
-except Exception:  # pragma: no cover
-    Image = None
 
 try:
     from numcodecs import Blosc
@@ -62,22 +52,11 @@ try:
 except Exception:  # pragma: no cover
     Parallel = delayed = None
 
-try:
-    from pystackreg import StackReg  # noqa: F401
-except Exception:  # pragma: no cover
-    StackReg = None
 
 try:
-    from skimage import transform  # noqa: F401
-    from skimage.transform import resize  # noqa: F401
-except Exception:  # pragma: no cover
-    transform = resize = None
-
-try:
-    from scipy.ndimage import gaussian_filter  # noqa: F401
     from scipy.ndimage import binary_dilation
 except Exception:  # pragma: no cover
-    gaussian_filter = None
+    binary_dilation = None
 
 # =============================================================================
 # Optional GUI deps (soft imports; required only for interactive functions/classes)

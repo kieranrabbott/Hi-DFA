@@ -1,5 +1,3 @@
-# omni_chunk76_utils.py
-
 import os
 import sys
 import time
@@ -8,7 +6,7 @@ import shutil
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import cv2
