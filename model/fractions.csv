@@ -1,0 +1,60 @@
+treatment length,concentration,culture_age,class,mean,total,discard
+4 hours,50 µg/mL ampicillin,24 hours,Incomplete treatment survivor,0.0,16070,Y
+4 hours,50 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,0.257691,16070,Y
+4 hours,50 µg/mL ampicillin,24 hours,Pre-existing persister,0.007729,16070,Y
+4 hours,50 µg/mL ampicillin,24 hours,Susceptible,99.734579,16070,Y
+4 hours,50 µg/mL ampicillin,24 hours,Incomplete treatment survivor,0.07466,16070,N
+4 hours,50 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,1.226956,16070,N
+4 hours,50 µg/mL ampicillin,24 hours,Pre-existing persister,0.006169,16070,N
+4 hours,50 µg/mL ampicillin,24 hours,Susceptible,98.692215,16070,N
+4 hours,50 µg/mL ampicillin,24 hours,Incomplete treatment survivor,0.056591,10656,N
+4 hours,50 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,1.717076,10656,N
+4 hours,50 µg/mL ampicillin,24 hours,Pre-existing persister,0.178325,10656,N
+4 hours,50 µg/mL ampicillin,24 hours,Susceptible,96.923233,10656,N
+2 hours,50 µg/mL ampicillin,24 hours,Incomplete treatment survivor,5.347686,4149,N
+2 hours,50 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,10.87322,4149,N
+2 hours,50 µg/mL ampicillin,24 hours,Pre-existing persister,0.024035,4149,N
+2 hours,50 µg/mL ampicillin,24 hours,Susceptible,83.755059,4149,N
+4 hours,50 µg/mL ampicillin,24 hours,Incomplete treatment survivor,0.012785,7846,N
+4 hours,50 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,0.687401,7846,N
+4 hours,50 µg/mL ampicillin,24 hours,Pre-existing persister,0.076596,7846,N
+4 hours,50 µg/mL ampicillin,24 hours,Susceptible,99.223218,7846,N
+8 hours,50 µg/mL ampicillin,24 hours,Incomplete treatment survivor,0.0,3087,N
+8 hours,50 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,0.0,3087,N
+8 hours,50 µg/mL ampicillin,24 hours,Pre-existing persister,0.03289,3087,N
+8 hours,50 µg/mL ampicillin,24 hours,Susceptible,99.96711,3087,N
+4 hours,50 µg/mL ampicillin,48 hours,Incomplete treatment survivor,0.014226,14077,N
+4 hours,50 µg/mL ampicillin,48 hours,Antibiotic-induced survivor,0.936982,14077,N
+4 hours,50 µg/mL ampicillin,48 hours,Pre-existing persister,0.035397,14077,N
+4 hours,50 µg/mL ampicillin,48 hours,VBNC,0.177948,14077,N
+4 hours,50 µg/mL ampicillin,48 hours,Susceptible,98.835448,14077,N
+4 hours,50 µg/mL ampicillin,24 hours,Incomplete treatment survivor,0.0,9387,N
+4 hours,50 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,0.458796,9387,N
+4 hours,50 µg/mL ampicillin,24 hours,Pre-existing persister,0.010566,9387,N
+4 hours,50 µg/mL ampicillin,24 hours,VBNC,0.064106,9387,N
+4 hours,50 µg/mL ampicillin,24 hours,Susceptible,99.466532,9387,N
+4 hours,50 µg/mL ampicillin,72 hours,Incomplete treatment survivor,0.026859,7471,N
+4 hours,50 µg/mL ampicillin,72 hours,Antibiotic-induced survivor,1.45908,7471,N
+4 hours,50 µg/mL ampicillin,72 hours,Pre-existing persister,0.079881,7471,N
+4 hours,50 µg/mL ampicillin,72 hours,VBNC,0.200995,7471,N
+4 hours,50 µg/mL ampicillin,72 hours,Susceptible,98.233186,7471,N
+4 hours,5 µg/mL ampicillin,24 hours,Incomplete treatment survivor,29.970493,16624,N
+4 hours,5 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,8.246579,16624,N
+4 hours,5 µg/mL ampicillin,24 hours,Pre-existing persister,0.024228,16624,N
+4 hours,5 µg/mL ampicillin,24 hours,Susceptible,61.7587,16624,N
+4 hours,250 µg/mL ampicillin,24 hours,Incomplete treatment survivor,0.0,13291,N
+4 hours,250 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,0.0,13291,N
+4 hours,250 µg/mL ampicillin,24 hours,Pre-existing persister,0.091278,13291,N
+4 hours,250 µg/mL ampicillin,24 hours,Susceptible,98.424655,13291,N
+4 hours,25 µg/mL ampicillin,24 hours,Incomplete treatment survivor,0.062316,9718,N
+4 hours,25 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,2.203065,9718,N
+4 hours,25 µg/mL ampicillin,24 hours,Pre-existing persister,0.308802,9718,N
+4 hours,25 µg/mL ampicillin,24 hours,Susceptible,96.119311,9718,N
+4 hours,2.5 µg/mL ampicillin,24 hours,Incomplete treatment survivor,53.039076,16570,N
+4 hours,2.5 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,15.606748,16570,N
+4 hours,2.5 µg/mL ampicillin,24 hours,Pre-existing persister,0.018124,16570,N
+4 hours,2.5 µg/mL ampicillin,24 hours,Susceptible,31.336052,16570,N
+4 hours,10 µg/mL ampicillin,24 hours,Incomplete treatment survivor,1.078318,161215,N
+4 hours,10 µg/mL ampicillin,24 hours,Antibiotic-induced survivor,4.415037,161215,N
+4 hours,10 µg/mL ampicillin,24 hours,Pre-existing persister,0.018543,161215,N
+4 hours,10 µg/mL ampicillin,24 hours,Susceptible,94.488102,161215,N
