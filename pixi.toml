@@ -1,0 +1,21 @@
+[workspace]
+authors = ["Kieran Abbott <ka537@cam.ac.uk>", "Georgeos Hardo <gh464@cantab.ac.uk>"]
+channels = ["conda-forge"]
+name = "HI-DFA"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.11.*"
+numpy = ">=2.4.2,<3"
+pandas = ">=3.0.0,<4"
+matplotlib = ">=3.10.8,<4"
+scipy = ">=1.17.0,<2"
+ipykernel = ">=7.1.0,<8"
+scienceplots = ">=2.2.0,<3"
+pip = ">=26.0.1,<27"
+seaborn = ">=0.13.2,<0.14"
+streamlit = ">=1.9.0,<2"
+joblib = ">=1.5.3,<2"
