@@ -8,6 +8,7 @@ import pandas as pd
 
 matplotlib.use("Agg")
 
+import model.core as core
 from model.core import STDPModel, STDPParams
 from model.data import load_data
 from model.fit import FitConfig, fit_stdp
@@ -55,6 +56,19 @@ class ModelRefactorTests(unittest.TestCase):
         pred = model.predict_condition(5.0, 2.0, 24.0)
         total = pred.incomplete + pred.induced + pred.preexisting + pred.dead
         self.assertAlmostEqual(total, 1.0, places=9)
+
+    def test_non_log_hazard_prediction_is_finite_at_high_dose(self):
+        original = core.USE_LOG_HAZARDS
+        core.USE_LOG_HAZARDS = False
+        try:
+            model = STDPModel(STDPParams())
+            pred = model.predict_condition(1000.0, 10.0, 24.0)
+            values = np.array([pred.incomplete, pred.induced, pred.preexisting, pred.dead], dtype=float)
+            self.assertTrue(np.isfinite(values).all())
+            self.assertGreaterEqual(values.min(), 0.0)
+            self.assertLessEqual(values.max(), 1.0)
+        finally:
+            core.USE_LOG_HAZARDS = original
 
     def test_load_data_from_canonical_dataframe(self):
         df = pd.DataFrame(

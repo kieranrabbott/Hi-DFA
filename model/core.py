@@ -7,7 +7,7 @@ from typing import Dict
 import numpy as np
 
 
-USE_LOG_HAZARDS = True
+USE_LOG_HAZARDS = False
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ class STDPParams:
     - rST uses a distinct exponent nST.
     """
 
-    k_lag: int = 3
+    k_lag: int = 4
     mu0: float = 0.23
     mu24p: float = 0.27
 
@@ -116,6 +116,56 @@ def _I_polyexp(b: float, tau: float, k: int) -> float:
     return float(I)
 
 
+def _exp_neg_alpha_tau_I_polyexp(
+    b: float,
+    lam: float,
+    alpha: float,
+    tau: float,
+    k: int,
+) -> float:
+    """
+    Return exp(-alpha * tau) * I_k(tau; b) stably.
+
+    This avoids overflow when b*tau is large and positive by never evaluating
+    exp(b*tau) directly in the recurrence.
+    """
+    t = float(tau)
+    if t <= 0.0:
+        return 0.0
+
+    bt = b * t
+    if abs(bt) < 1e-6:
+        s = t**k / k
+        term = s
+        mm = 1
+        while True:
+            term *= bt / (k + mm)
+            term /= mm
+            s += term
+            if abs(term) < 1e-15 * max(abs(s), 1.0) or mm > 200:
+                break
+            mm += 1
+        return float(np.exp(-alpha * t) * s)
+
+    exp_neg_lam_t = np.exp(-lam * t)
+    exp_neg_alpha_t = np.exp(-alpha * t)
+
+    scaled_I = (exp_neg_lam_t - exp_neg_alpha_t) / b
+    for kk in range(2, k + 1):
+        scaled_I = exp_neg_lam_t * t ** (kk - 1) / b - (kk - 1) / b * scaled_I
+    return float(scaled_I)
+
+
+def _exp_neg_alpha_tau_J_trunc(k: int, lam: float, alpha: float, tau: float) -> float:
+    """
+    Return exp(-alpha * tau) * J(alpha), where
+    J(alpha) = ∫_0^tau e^{alpha l} f_Erlang(l; k, lam) dl.
+    """
+    b = alpha - lam
+    scaled_I = _exp_neg_alpha_tau_I_polyexp(b, lam, alpha, tau, k)
+    return float((lam**k) * scaled_I / factorial(k - 1))
+
+
 def _J_trunc(k: int, lam: float, alpha: float, tau: float) -> float:
     """J(alpha) = ∫_0^tau e^{alpha l} f_Erlang(l; k, lam) dl."""
     b = alpha - lam
@@ -169,8 +219,8 @@ class STDPModel:
         r = rST(C, a, self.p.kST, self.p.nST, self.p.a50, self.p.r0)
         H = h_s + r
         lam = self.lam_from_mean(a)
-        JH = _J_trunc(self.p.k_lag, lam, H, tau)
-        return float(np.clip(np.exp(-H * tau) * JH, 0.0, 1.0))
+        scaled_JH = _exp_neg_alpha_tau_J_trunc(self.p.k_lag, lam, H, tau)
+        return float(np.clip(scaled_JH, 0.0, 1.0))
 
     def pi_induced(self, C: float, tau: float, a: float) -> float:
         r = rST(C, a, self.p.kST, self.p.nST, self.p.a50, self.p.r0)
@@ -180,13 +230,16 @@ class STDPModel:
         H = h_s + r
         lam = self.lam_from_mean(a)
 
-        if abs(H - ht) > 1e-10:
-            Jh = _J_trunc(self.p.k_lag, lam, ht, tau)
-            JH = _J_trunc(self.p.k_lag, lam, H, tau)
-            val = (r / (H - ht)) * (np.exp(-ht * tau) * Jh - np.exp(-H * tau) * JH)
+        scaled_Jh = _exp_neg_alpha_tau_J_trunc(self.p.k_lag, lam, ht, tau)
+        scaled_JH = _exp_neg_alpha_tau_J_trunc(self.p.k_lag, lam, H, tau)
+
+        if abs(H - ht) > 1e-10 * max(1.0, abs(H), abs(ht)):
+            val = (r / (H - ht)) * (scaled_Jh - scaled_JH)
         else:
-            Jh, dJh = _J_and_dJ_trunc(self.p.k_lag, lam, ht, tau)
-            val = r * np.exp(-ht * tau) * (tau * Jh - dJh)
+            eps = 1e-6 * max(1.0, abs(ht))
+            scaled_Jh_plus = _exp_neg_alpha_tau_J_trunc(self.p.k_lag, lam, ht + eps, tau)
+            d_scaled_J = (scaled_Jh_plus - scaled_Jh) / eps
+            val = -r * d_scaled_J
 
         return float(np.clip(val, 0.0, 1.0))
 
