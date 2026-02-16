@@ -79,6 +79,7 @@ def fit_stdp(
     rho: float = 0.8,
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
+    lam_hill_constraint: float = 1e6,
 ) -> FitResult:
     cfg = (config or FitConfig()).resolved()
     rng = np.random.default_rng(cfg.seed)
@@ -88,6 +89,7 @@ def fit_stdp(
         free_keys=free_keys,
         kappa=kappa,
         lam_pen=lam_pen,
+        lam_hill_constraint=lam_hill_constraint,
         rho=rho,
         ages_for_pen=ages_for_pen,
         class_weights=class_weights,
@@ -141,6 +143,7 @@ def _fit_for_k(
     config: FitConfig,
     kappa: float,
     lam_pen: float,
+    lam_hill_constraint: float,
     rho: float,
     ages_for_pen,
     class_weights,
@@ -156,6 +159,7 @@ def _fit_for_k(
         config=config_k,
         kappa=kappa,
         lam_pen=lam_pen,
+        lam_hill_constraint=lam_hill_constraint,
         rho=rho,
         ages_for_pen=ages_for_pen,
         class_weights=class_weights,
@@ -174,6 +178,7 @@ def fit_over_k_lag(
     rho: float = 0.8,
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
+    lam_hill_constraint: float = 1e6,
     n_jobs: int = -1,
 ) -> KLagSearchResult:
     cfg = (config or FitConfig()).resolved()
@@ -191,6 +196,7 @@ def fit_over_k_lag(
                 cfg,
                 kappa,
                 lam_pen,
+                lam_hill_constraint,
                 rho,
                 ages_for_pen,
                 class_weights,
@@ -207,6 +213,7 @@ def fit_over_k_lag(
                 cfg,
                 kappa,
                 lam_pen,
+                lam_hill_constraint,
                 rho,
                 ages_for_pen,
                 class_weights,

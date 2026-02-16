@@ -24,6 +24,7 @@ class WorkflowConfig:
     fit_config: FitConfig = field(default_factory=FitConfig)
     kappa: float = 5000.0
     lam_pen: float = 1e-2
+    lam_hill_constraint: float = 1e6
     rho: float = 0.8
     ages_for_pen: tuple[float, ...] = (24.0, 48.0, 72.0)
     class_weights: tuple[float, float, float, float] | None = None
@@ -84,6 +85,7 @@ class ModelWorkflow:
             config=fit_cfg,
             kappa=self.config.kappa,
             lam_pen=self.config.lam_pen,
+            lam_hill_constraint=self.config.lam_hill_constraint,
             rho=self.config.rho,
             ages_for_pen=self.config.ages_for_pen,
             class_weights=self.config.class_weights,
@@ -156,6 +158,7 @@ class ModelWorkflow:
                 config=cfg,
                 kappa=self.config.kappa,
                 lam_pen=self.config.lam_pen,
+                lam_hill_constraint=self.config.lam_hill_constraint,
                 rho=self.config.rho,
                 ages_for_pen=self.config.ages_for_pen,
                 class_weights=self.config.class_weights,

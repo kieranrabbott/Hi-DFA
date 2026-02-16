@@ -5,7 +5,7 @@ from typing import Callable, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
-from .core import STDPModel, STDPParams, hS, hT
+from .core import STDPModel, STDPParams, get_hill_hazard_flags, hS, hT
 
 
 EPS_LOG_LOWER = 1e-8
@@ -16,6 +16,8 @@ NUM_BOUNDS = {
     "kS_kT_ratio": (1.0, 1000.0),
     "kT": (1e-4, 100.0),
     "kST": (1e-3, 100.0),
+    "K": (1e-6, 1e6),
+    "KST": (1e-6, 1e6),
     "n": (0.0, 40.5),
     "nST": (0.0, 40.5),
     "a50": (10.0, 300000.0),
@@ -107,8 +109,8 @@ def _tolerance_penalty(
 
     for a in ages:
         for C in Cs:
-            hs = hS(C, p.kT, p.kS_kT_ratio, p.n)
-            ht = hT(C, p.kT, p.n)
+            hs = hS(C, p.kT, p.kS_kT_ratio, p.n, p.K)
+            ht = hT(C, p.kT, p.n, p.K)
 
             if hs <= 1e-12:
                 continue
@@ -117,6 +119,37 @@ def _tolerance_penalty(
 
     denom = nC * max(len(ages), 1)
     return float(total / max(denom, 1))
+
+
+def _hill_lambda_constraint_penalty(
+    p: STDPParams,
+    ages: Tuple[float, ...],
+    weight: float = 1e6,
+) -> float:
+    """
+    Enforce lambda(age) <= hT_inf under Hill hT kinetics.
+
+    For hT(C) = kT * C^n / (K^n + C^n), hT_inf = kT.
+    """
+    if weight <= 0:
+        return 0.0
+
+    hill_flags = get_hill_hazard_flags()
+    if not hill_flags["hT_effective"]:
+        return 0.0
+
+    model = STDPModel(p)
+    ht_inf = float(p.kT)
+    max_violation = 0.0
+
+    for age in ages:
+        lam = model.lam_from_mean(float(age))
+        max_violation = max(max_violation, lam - ht_inf)
+
+    if max_violation <= 0.0:
+        return 0.0
+
+    return float(weight * (max_violation**2))
 
 
 def _pack_params(p: STDPParams, free_keys: List[str]) -> np.ndarray:
@@ -161,9 +194,13 @@ def make_objective(
     rho: float = 0.8,
     ages_for_pen: Tuple[float, ...] = (24.0, 48.0, 72.0),
     class_weights=None,
+    lam_hill_constraint: float = 1e6,
 ):
     free_keys = DEFAULT_FREE_KEYS if free_keys is None else list(free_keys)
     P_obs = _observed_matrix(data)
+    ages_for_constraint = tuple(sorted({float(row[3]) for row in data}))
+    if not ages_for_constraint:
+        ages_for_constraint = ages_for_pen
 
     def objective(x: np.ndarray, template: STDPParams) -> float:
         cand = _unpack_params(x, template, free_keys)
@@ -171,6 +208,11 @@ def make_objective(
         P_pred = _pred_matrix(model, data)
         nll = _nll_dirichlet(P_obs, P_pred, kappa=kappa, class_weights=class_weights)
         pen = _tolerance_penalty(cand, rho=rho, ages=ages_for_pen)
-        return float(nll + lam_pen * pen)
+        hill_pen = _hill_lambda_constraint_penalty(
+            cand,
+            ages=ages_for_constraint,
+            weight=lam_hill_constraint,
+        )
+        return float(nll + lam_pen * pen + hill_pen)
 
     return objective, free_keys

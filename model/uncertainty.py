@@ -9,6 +9,7 @@ from scipy.optimize import minimize
 
 from .core import STDPModel, STDPParams
 from .objective import (
+    _hill_lambda_constraint_penalty,
     _log_bounds,
     _nll_dirichlet,
     _observed_matrix,
@@ -35,11 +36,15 @@ def build_objectives(
     free_keys,
     kappa=5000.0,
     lam_pen=1e-2,
+    lam_hill_constraint=1e6,
     rho=0.8,
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
 ):
     P_obs = _observed_matrix(data)
+    ages_for_constraint = tuple(sorted({float(row[3]) for row in data}))
+    if not ages_for_constraint:
+        ages_for_constraint = ages_for_pen
 
     def unpack(z):
         return _unpack_params(z, template, free_keys)
@@ -54,8 +59,16 @@ def build_objectives(
         p = unpack(z)
         return _tolerance_penalty(p, rho=rho, ages=ages_for_pen)
 
+    def hill_constraint_only(z):
+        p = unpack(z)
+        return _hill_lambda_constraint_penalty(
+            p,
+            ages=ages_for_constraint,
+            weight=lam_hill_constraint,
+        )
+
     def total(z):
-        return nll_only(z) + lam_pen * pen_only(z)
+        return nll_only(z) + lam_pen * pen_only(z) + hill_constraint_only(z)
 
     return total, nll_only, pen_only, unpack
 
@@ -146,6 +159,7 @@ def draw_laplace_samples(
     config: UncertaintyConfig | None = None,
     kappa: float = 5000.0,
     lam_pen: float = 1e-2,
+    lam_hill_constraint: float = 1e6,
     rho: float = 0.8,
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
@@ -158,6 +172,7 @@ def draw_laplace_samples(
         free_keys=list(free_keys),
         kappa=kappa,
         lam_pen=lam_pen,
+        lam_hill_constraint=lam_hill_constraint,
         rho=rho,
         ages_for_pen=ages_for_pen,
         class_weights=class_weights,

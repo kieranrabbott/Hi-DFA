@@ -12,7 +12,7 @@ import model.core as core
 from model.core import STDPModel, STDPParams
 from model.data import load_data
 from model.fit import FitConfig, fit_stdp
-from model.objective import _pack_params
+from model.objective import _hill_lambda_constraint_penalty, _pack_params
 from model.plotting_basic import evaluate_model, plot_fraction_comparison
 from model.uncertainty import compute_prediction_ci
 
@@ -69,6 +69,104 @@ class ModelRefactorTests(unittest.TestCase):
             self.assertLessEqual(values.max(), 1.0)
         finally:
             core.USE_LOG_HAZARDS = original
+
+    def test_independent_log_hazard_overrides(self):
+        old_flags = core.get_log_hazard_flags()
+        try:
+            C = 10.0
+            a = 24.0
+            p = STDPParams(kT=0.5, kS_kT_ratio=5.0, kST=1.35, n=2.0, nST=1.5, a50=20.0, r0=0.01)
+
+            hs_linear = p.kT * p.kS_kT_ratio * (C**p.n)
+            ht_linear = p.kT * (C**p.n)
+            rst_linear = core.m(a, p.a50) * (p.r0 + p.kST * (C**p.nST))
+
+            core.set_log_hazard_flags(global_default=False, hS=True, hT=False, rST=False)
+            self.assertAlmostEqual(core.hS(C, p.kT, p.kS_kT_ratio, p.n), np.log1p(hs_linear), places=12)
+            self.assertAlmostEqual(core.hT(C, p.kT, p.n), ht_linear, places=12)
+            self.assertAlmostEqual(
+                core.rST(C, a, p.kST, p.nST, p.a50, p.r0),
+                rst_linear,
+                places=12,
+            )
+
+            core.set_log_hazard_flags(hS=None, hT=None, rST=None)
+            core.set_log_hazard_flags(global_default=True)
+            self.assertAlmostEqual(core.hS(C, p.kT, p.kS_kT_ratio, p.n), np.log1p(hs_linear), places=12)
+            self.assertAlmostEqual(core.hT(C, p.kT, p.n), np.log1p(ht_linear), places=12)
+        finally:
+            core.USE_LOG_HAZARDS = old_flags["global_default"]
+            core.USE_LOG_HAZARDS_HS = old_flags["hS_override"]
+            core.USE_LOG_HAZARDS_HT = old_flags["hT_override"]
+            core.USE_LOG_HAZARDS_RST = old_flags["rST_override"]
+
+    def test_hill_hazard_forms_and_log_layering(self):
+        old_log = core.get_log_hazard_flags()
+        old_hill = core.get_hill_hazard_flags()
+        try:
+            C = 10.0
+            a = 24.0
+            p = STDPParams(
+                kT=2.0,
+                kS_kT_ratio=3.0,
+                kST=1.5,
+                K=5.0,
+                KST=7.0,
+                n=2.0,
+                nST=3.0,
+                a50=20.0,
+                r0=0.1,
+            )
+
+            core.set_hill_hazard_flags(global_default=False, hS=True, hT=True, rST=True)
+            core.set_log_hazard_flags(global_default=False, hS=False, hT=False, rST=False)
+
+            ht_hill = p.kT * (C**p.n) / ((p.K**p.n) + (C**p.n))
+            hs_hill = p.kT * p.kS_kT_ratio * (C**p.n) / ((p.K**p.n) + (C**p.n))
+            rst_hill_inner = p.kST * (C**p.nST) / ((p.KST**p.nST) + (C**p.nST))
+            rst_hill = core.m(a, p.a50) * (p.r0 + rst_hill_inner)
+
+            self.assertAlmostEqual(core.hT(C, p.kT, p.n, p.K), ht_hill, places=12)
+            self.assertAlmostEqual(core.hS(C, p.kT, p.kS_kT_ratio, p.n, p.K), hs_hill, places=12)
+            self.assertAlmostEqual(
+                core.rST(C, a, p.kST, p.nST, p.a50, p.r0, p.KST),
+                rst_hill,
+                places=12,
+            )
+
+            core.set_log_hazard_flags(hT=True)
+            self.assertAlmostEqual(core.hT(C, p.kT, p.n, p.K), np.log1p(ht_hill), places=12)
+        finally:
+            core.USE_LOG_HAZARDS = old_log["global_default"]
+            core.USE_LOG_HAZARDS_HS = old_log["hS_override"]
+            core.USE_LOG_HAZARDS_HT = old_log["hT_override"]
+            core.USE_LOG_HAZARDS_RST = old_log["rST_override"]
+            core.USE_HILL_HAZARD = old_hill["global_default"]
+            core.USE_HILL_HAZARD_HS = old_hill["hS_override"]
+            core.USE_HILL_HAZARD_HT = old_hill["hT_override"]
+            core.USE_HILL_HAZARD_RST = old_hill["rST_override"]
+
+    def test_hill_lambda_constraint_penalty(self):
+        old_hill = core.get_hill_hazard_flags()
+        try:
+            core.set_hill_hazard_flags(global_default=False, hS=False, hT=True, rST=False)
+
+            p_bad = STDPParams(k_lag=6, mu0=0.2, mu24p=0.2, kT=1.0)
+            bad_pen = _hill_lambda_constraint_penalty(p_bad, ages=(24.0,), weight=1e6)
+            self.assertGreater(bad_pen, 0.0)
+
+            p_good = STDPParams(k_lag=6, mu0=2.0, mu24p=2.0, kT=2.0)
+            good_pen = _hill_lambda_constraint_penalty(p_good, ages=(24.0,), weight=1e6)
+            self.assertEqual(good_pen, 0.0)
+
+            core.set_hill_hazard_flags(hT=False)
+            off_pen = _hill_lambda_constraint_penalty(p_bad, ages=(24.0,), weight=1e6)
+            self.assertEqual(off_pen, 0.0)
+        finally:
+            core.USE_HILL_HAZARD = old_hill["global_default"]
+            core.USE_HILL_HAZARD_HS = old_hill["hS_override"]
+            core.USE_HILL_HAZARD_HT = old_hill["hT_override"]
+            core.USE_HILL_HAZARD_RST = old_hill["rST_override"]
 
     def test_load_data_from_canonical_dataframe(self):
         df = pd.DataFrame(

@@ -8,6 +8,112 @@ import numpy as np
 
 
 USE_LOG_HAZARDS = False
+USE_LOG_HAZARDS_HS: bool | None = None
+USE_LOG_HAZARDS_HT: bool | None = None
+USE_LOG_HAZARDS_RST: bool | None = None
+USE_HILL_HAZARD = False
+USE_HILL_HAZARD_HS: bool | None = None
+USE_HILL_HAZARD_HT: bool | None = None
+USE_HILL_HAZARD_RST: bool | None = None
+_UNCHANGED = object()
+
+
+def _resolve_log_hazard_flag(override: bool | None) -> bool:
+    if override is None:
+        return bool(USE_LOG_HAZARDS)
+    return bool(override)
+
+
+def _resolve_hill_hazard_flag(override: bool | None) -> bool:
+    if override is None:
+        return bool(USE_HILL_HAZARD)
+    return bool(override)
+
+
+def set_log_hazard_flags(
+    *,
+    global_default=_UNCHANGED,
+    hS=_UNCHANGED,
+    hT=_UNCHANGED,
+    rST=_UNCHANGED,
+) -> dict[str, bool | None]:
+    """
+    Set hazard log-transform flags.
+
+    `USE_LOG_HAZARDS` remains the global fallback. Per-hazard overrides
+    (`hS`, `hT`, `rST`) take precedence when set. Pass `None` for a per-hazard
+    override to clear it and fall back to `global_default`.
+    """
+    global USE_LOG_HAZARDS
+    global USE_LOG_HAZARDS_HS, USE_LOG_HAZARDS_HT, USE_LOG_HAZARDS_RST
+
+    if global_default is not _UNCHANGED:
+        if global_default is None:
+            raise ValueError("global_default must be True or False when provided.")
+        USE_LOG_HAZARDS = bool(global_default)
+    if hS is not _UNCHANGED:
+        USE_LOG_HAZARDS_HS = None if hS is None else bool(hS)
+    if hT is not _UNCHANGED:
+        USE_LOG_HAZARDS_HT = None if hT is None else bool(hT)
+    if rST is not _UNCHANGED:
+        USE_LOG_HAZARDS_RST = None if rST is None else bool(rST)
+
+    return get_log_hazard_flags()
+
+
+def get_log_hazard_flags() -> dict[str, bool | None]:
+    return {
+        "global_default": bool(USE_LOG_HAZARDS),
+        "hS_override": USE_LOG_HAZARDS_HS,
+        "hT_override": USE_LOG_HAZARDS_HT,
+        "rST_override": USE_LOG_HAZARDS_RST,
+        "hS_effective": _resolve_log_hazard_flag(USE_LOG_HAZARDS_HS),
+        "hT_effective": _resolve_log_hazard_flag(USE_LOG_HAZARDS_HT),
+        "rST_effective": _resolve_log_hazard_flag(USE_LOG_HAZARDS_RST),
+    }
+
+
+def set_hill_hazard_flags(
+    *,
+    global_default=_UNCHANGED,
+    hS=_UNCHANGED,
+    hT=_UNCHANGED,
+    rST=_UNCHANGED,
+) -> dict[str, bool | None]:
+    """
+    Set Hill-form hazard flags.
+
+    `USE_HILL_HAZARD` is the global fallback. Per-hazard overrides
+    (`hS`, `hT`, `rST`) take precedence when set. Pass `None` for a
+    per-hazard override to clear it and fall back to `global_default`.
+    """
+    global USE_HILL_HAZARD
+    global USE_HILL_HAZARD_HS, USE_HILL_HAZARD_HT, USE_HILL_HAZARD_RST
+
+    if global_default is not _UNCHANGED:
+        if global_default is None:
+            raise ValueError("global_default must be True or False when provided.")
+        USE_HILL_HAZARD = bool(global_default)
+    if hS is not _UNCHANGED:
+        USE_HILL_HAZARD_HS = None if hS is None else bool(hS)
+    if hT is not _UNCHANGED:
+        USE_HILL_HAZARD_HT = None if hT is None else bool(hT)
+    if rST is not _UNCHANGED:
+        USE_HILL_HAZARD_RST = None if rST is None else bool(rST)
+
+    return get_hill_hazard_flags()
+
+
+def get_hill_hazard_flags() -> dict[str, bool | None]:
+    return {
+        "global_default": bool(USE_HILL_HAZARD),
+        "hS_override": USE_HILL_HAZARD_HS,
+        "hT_override": USE_HILL_HAZARD_HT,
+        "rST_override": USE_HILL_HAZARD_RST,
+        "hS_effective": _resolve_hill_hazard_flag(USE_HILL_HAZARD_HS),
+        "hT_effective": _resolve_hill_hazard_flag(USE_HILL_HAZARD_HT),
+        "rST_effective": _resolve_hill_hazard_flag(USE_HILL_HAZARD_RST),
+    }
 
 
 @dataclass(frozen=True)
@@ -42,6 +148,8 @@ class STDPParams:
     kT: float = 0.5
     kS_kT_ratio: float = 5.0
     kST: float = 1.35
+    K: float = 1.0
+    KST: float = 1.0
 
     n: float = 2.0
     nST: float = 1.5
@@ -55,39 +163,64 @@ def m(a: float, a50: float) -> float:
     return float(a) / (float(a) + float(a50))
 
 
-def hS(C: float, kT: float, kS_kT_ratio: float, nS: float) -> float:
+def hS(C: float, kT: float, kS_kT_ratio: float, nS: float, K: float = 1.0) -> float:
     """Susceptible-state death hazard."""
     C = float(C)
     if C <= 0.0:
         return 0.0
 
-    base_hazard = float(kT * kS_kT_ratio * (C**nS))
-    if USE_LOG_HAZARDS:
+    if _resolve_hill_hazard_flag(USE_HILL_HAZARD_HS):
+        c_pow = C**nS
+        denom = (float(K) ** nS) + c_pow
+        base_hazard = float(kT * kS_kT_ratio * c_pow / max(denom, 1e-300))
+    else:
+        base_hazard = float(kT * kS_kT_ratio * (C**nS))
+
+    if _resolve_log_hazard_flag(USE_LOG_HAZARDS_HS):
         return float(np.log1p(base_hazard))
     return base_hazard
 
 
-def hT(C: float, kT: float, nT: float) -> float:
+def hT(C: float, kT: float, nT: float, K: float = 1.0) -> float:
     """Tolerant-state death hazard."""
     C = float(C)
     if C <= 0.0:
         return 0.0
 
-    base_hazard = float(kT * (C**nT))
-    if USE_LOG_HAZARDS:
+    if _resolve_hill_hazard_flag(USE_HILL_HAZARD_HT):
+        c_pow = C**nT
+        denom = (float(K) ** nT) + c_pow
+        base_hazard = float(kT * c_pow / max(denom, 1e-300))
+    else:
+        base_hazard = float(kT * (C**nT))
+
+    if _resolve_log_hazard_flag(USE_LOG_HAZARDS_HT):
         return float(np.log1p(base_hazard))
     return base_hazard
 
 
-def rST(C: float, a: float, kST: float, nST: float, a50: float, r0: float) -> float:
+def rST(
+    C: float,
+    a: float,
+    kST: float,
+    nST: float,
+    a50: float,
+    r0: float,
+    KST: float = 1.0,
+) -> float:
     """S -> T switching hazard."""
     C = float(C)
     baseline = float(r0)
     if C <= 0.0:
         hazard_C = 0.0
     else:
-        hazard_C = float(kST * (C**nST))
-        if USE_LOG_HAZARDS:
+        if _resolve_hill_hazard_flag(USE_HILL_HAZARD_RST):
+            c_num = C**nST
+            denom = (float(KST) ** nST) + c_num
+            hazard_C = float(kST * c_num / max(denom, 1e-300))
+        else:
+            hazard_C = float(kST * (C**nST))
+        if _resolve_log_hazard_flag(USE_LOG_HAZARDS_RST):
             hazard_C = float(np.log1p(hazard_C))
     return float(m(a, a50) * (baseline + hazard_C))
 
@@ -215,17 +348,17 @@ class STDPModel:
         return float(np.clip(_erlang_sf(self.p.k_lag, lam, tau), 0.0, 1.0))
 
     def pi_incomplete(self, C: float, tau: float, a: float) -> float:
-        h_s = hS(C, self.p.kT, self.p.kS_kT_ratio, self.p.n)
-        r = rST(C, a, self.p.kST, self.p.nST, self.p.a50, self.p.r0)
+        h_s = hS(C, self.p.kT, self.p.kS_kT_ratio, self.p.n, self.p.K)
+        r = rST(C, a, self.p.kST, self.p.nST, self.p.a50, self.p.r0, self.p.KST)
         H = h_s + r
         lam = self.lam_from_mean(a)
         scaled_JH = _exp_neg_alpha_tau_J_trunc(self.p.k_lag, lam, H, tau)
         return float(np.clip(scaled_JH, 0.0, 1.0))
 
     def pi_induced(self, C: float, tau: float, a: float) -> float:
-        r = rST(C, a, self.p.kST, self.p.nST, self.p.a50, self.p.r0)
-        ht = hT(C, self.p.kT, self.p.n)
-        h_s = hS(C, self.p.kT, self.p.kS_kT_ratio, self.p.n)
+        r = rST(C, a, self.p.kST, self.p.nST, self.p.a50, self.p.r0, self.p.KST)
+        ht = hT(C, self.p.kT, self.p.n, self.p.K)
+        h_s = hS(C, self.p.kT, self.p.kS_kT_ratio, self.p.n, self.p.K)
 
         H = h_s + r
         lam = self.lam_from_mean(a)
