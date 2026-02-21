@@ -208,3 +208,5 @@ __marimo__/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+*.pickle
+tests/abx_effects/joint_model_fast

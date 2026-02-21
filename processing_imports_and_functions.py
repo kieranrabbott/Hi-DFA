@@ -1,69 +1,44 @@
-# ==============================================================================
-# 1. IMPORTS
-# ==============================================================================
-# Standard Library
 import json
 import random
 import warnings
 
-# Suppress the specific CuPy experimental feature warning
-warnings.filterwarnings("ignore", message=".*cupyx.jit.rawkernel is experimental.*") 
+warnings.filterwarnings("ignore", message=".*cupyx.jit.rawkernel is experimental.*")
 
-# Data Science & Math
 import numpy as np
 import pandas as pd
-
-# Image Processing
 import cv2
 import skimage.measure
 from skimage.measure import regionprops_table
-
-# GPU Computing
 import cupy as cp
 from cupyx.scipy.signal import fftconvolve as gpu_fftconvolve
-
-# Parallel Computing & Dask
 import dask
 import dask.array as da
 from dask.diagnostics import ProgressBar
 from dask.distributed import Client, LocalCluster
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
-
-# I/O & Storage
 import zarr
 from numcodecs import Blosc
-
-# Visualization (Static)
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-
-# Visualization (Interactive/GUI)
 import napari
 
-# ==============================================================================
-# 2. CONFIGURATION & CONSTANTS
-# ==============================================================================
-
-# --- Compression ---
 compressor = Blosc(cname='zstd', clevel=9, shuffle=Blosc.BITSHUFFLE)
 
-# --- Global Defaults (Filtering) ---
 DEFAULT_MIN_SIZE = 100
 DEFAULT_SOLIDITY = 0.86
-
-# Global variables for MagicGUI state
 min_size = DEFAULT_MIN_SIZE
 min_solidity = DEFAULT_SOLIDITY
 
-# --- Axis Definitions (Assumed for 5D: T, Z, C, Y, X) ---
+# Axis indices for 5D arrays (T, Z, C, Y, X)
 C_AXIS = 2
 Y_AXIS = 3
 X_AXIS = 4
 
-# ==============================================================================
-# 3. GENERIC UTILITIES & IO
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Generic utilities & IO
+# ---------------------------------------------------------------------------
 
 def load_data(trenches_path, masks_path, config_path):
     """Loads trenches and masks for interactive viewing."""
@@ -131,9 +106,10 @@ def get_overlay(img_gray, mask_binary, color=(1, 0, 0), alpha=0.3):
     img_rgb[mask_indices] = alpha * overlay[mask_indices] + (1 - alpha) * img_rgb[mask_indices]
     return img_rgb
 
-# ==============================================================================
-# 4. ALIGNMENT LOGIC
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Alignment
+# ---------------------------------------------------------------------------
 
 def get_image_shifts(FL_image, masks, padding=8):
     """Calculates (x, y) shift using GPU FFT convolution."""
@@ -218,13 +194,9 @@ def run_alignment_test(images, masks, channels, padding=8, n_test_ids=3):
     
     print(f"--- Running Test Alignment on IDs: {test_ids} (Padding={padding}) ---")
 
-    # 2. Slice Data (Lazy)
-    # Using Dask slicing preserves the chunk structure needed for map_blocks
     img_sub = images[test_ids]
     msk_sub = masks[test_ids]
-    
-    # 3. Run Alignment
-    # We compute immediately since this is a small test batch
+
     aligned_result = da.map_blocks(
         align_block_wrapper,
         img_sub,
@@ -238,7 +210,6 @@ def run_alignment_test(images, masks, channels, padding=8, n_test_ids=3):
     
     print("Alignment Calculation Complete.")
 
-    # 4. Visualize
     visualize_alignment(
         img_sub, 
         aligned_result, 
@@ -253,7 +224,6 @@ def run_batch_alignment(images, masks, output_path, channels, padding=8, client=
     """
     print(f"--- Processing FULL Dataset (Padding={padding}) ---")
 
-    # 1. Define Lazy Computation Graph
     aligned_full = da.map_blocks(
         align_block_wrapper,
         images,
@@ -265,19 +235,18 @@ def run_batch_alignment(images, masks, output_path, channels, padding=8, client=
         padding=padding
     )
 
-    # 2. Execute and Write
     print("Writing to Zarr...")
     if client:
         print(f"Cluster: {client.dashboard_link}")
-    
-    # compute=True triggers the actual processing on the cluster
+
     aligned_full.to_zarr(output_path, compute=True, overwrite=True)
     
     print("Alignment Batch Complete.")
 
-# ==============================================================================
-# 5. FILTERING LOGIC
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
 
 from dask.distributed import get_client
 import time
@@ -305,7 +274,6 @@ def _filter_frame_logic(frame, min_area, min_solidity,
     
     bad_labels = set()
 
-    # 1. Edge Filter
     if use_edge:
         if top_dist > 0:
             bad_labels.update(np.unique(frame[:top_dist, :]))
@@ -314,19 +282,16 @@ def _filter_frame_logic(frame, min_area, min_solidity,
             bad_labels.update(np.unique(frame[:, -side_dist:]))
         bad_labels.discard(0)
 
-    # 2. Area Filter
     if use_area or (use_sol and min_solidity > 0.0):
         labels, counts = np.unique(frame, return_counts=True)
         if use_area:
             small_lbls = labels[(labels != 0) & (counts < min_area)]
             bad_labels.update(small_lbls)
 
-    # Apply removals
     if bad_labels:
         frame = _remove_labels_fast(frame, bad_labels)
         if not np.any(frame): return frame
 
-    # 3. Solidity Filter
     if use_sol and min_solidity > 0.0:
         from skimage.measure import regionprops_table
         with warnings.catch_warnings():
@@ -364,8 +329,6 @@ def run_batch_filtering(input_path, output_path, filtering_params, n_jobs=20, li
     """
     start_time = time.time()
     
-    # 1. Setup Dask Input
-    # We slice immediately if limit is provided to reduce graph size
     dask_in = da.from_zarr(input_path)
     source_z = zarr.open(input_path, mode='r')
     
@@ -377,7 +340,6 @@ def run_batch_filtering(input_path, output_path, filtering_params, n_jobs=20, li
     
     print(f"Input Shape: {dask_in.shape} | Chunk Size: {source_z.chunks}")
     
-    # 2. Define Computation Graph
     dask_filtered = dask_in.map_blocks(
         filter_chunk,
         min_area=filtering_params['min_area'],
@@ -390,7 +352,6 @@ def run_batch_filtering(input_path, output_path, filtering_params, n_jobs=20, li
         dtype=dask_in.dtype
     )
     
-    # 3. Prepare Output Zarr
     z_out = zarr.open(
         output_path, mode='w', 
         shape=dask_in.shape, 
@@ -399,7 +360,6 @@ def run_batch_filtering(input_path, output_path, filtering_params, n_jobs=20, li
         compressor=compressor
     )
     
-    # 4. Check for Distributed Client
     try:
         client = get_client()
         print(f"Using Active Dask Cluster: {client.dashboard_link}")
@@ -408,45 +368,32 @@ def run_batch_filtering(input_path, output_path, filtering_params, n_jobs=20, li
         print(f"No active cluster found. Using local 'processes' scheduler with {n_jobs} workers.")
         scheduler_kwargs = {'scheduler': 'processes', 'num_workers': n_jobs}
 
-    # 5. Execute
-    # We suppress the progress bar for benchmarks to keep logs clean, unless n_jobs is large
-    # For user feedback, we will keep it simple
     dask_filtered.store(z_out, lock=False, **scheduler_kwargs)
-        
-    # 6. Report Time
+
     elapsed = time.time() - start_time
     print(f"Batch processing complete. Time taken: {elapsed/60:.2f} minutes.")
     
 
-# ==============================================================================
-# 6. FEATURE EXTRACTION (DASK NATIVE)
-# ==============================================================================
 
-def worker_extract_from_chunk(trench_block, mask_block, start_id, channels, channel_indices, 
+# ---------------------------------------------------------------------------
+# Feature extraction (Dask)
+# ---------------------------------------------------------------------------
+
+def worker_extract_from_chunk(trench_block, mask_block, start_id, channels, channel_indices,
                               upscale=False, new_size=None, extract_features=None):
-    """
-    Worker function: Receives a Dask chunk (numpy array) and extracts features.
-    """
-    # 1. Handle Dask 5D -> 4D Slicing safely in worker
-    # If mask block comes in as (Batch, Time, 1, Y, X), squeeze it here
-    if mask_block.ndim == 5:
-        if mask_block.shape[2] == 1:
-            mask_block = mask_block[:, :, 0, :, :]
-        # If shape[2] != 1, we assume it's already 4D or different layout, 
-        # but standard pipeline produces (N, T, 1, Y, X)
-        
+    """Worker: receives a Dask chunk (numpy array) and extracts features."""
+    if mask_block.ndim == 5 and mask_block.shape[2] == 1:
+        mask_block = mask_block[:, :, 0, :, :]
+
     n_batch = trench_block.shape[0]
     n_frames = trench_block.shape[1]
-    
     batch_results = []
-    
-    # 2. Iterate through the chunk
+
     for local_i in range(n_batch):
         global_id = start_id + local_i
         
-        # Extract single trench data
-        trench_data = trench_block[local_i] # (Time, C, Y, X)
-        mask_data = mask_block[local_i]     # (Time, Y, X)
+        trench_data = trench_block[local_i]
+        mask_data = mask_block[local_i]
         
         for t in range(n_frames):
             mask = mask_data[t]
@@ -527,7 +474,6 @@ def run_feature_extraction(trenches_path, masks_path, channels, channel_indices,
     print(f"--- Starting Feature Extraction (Dask) ---")
     start_time = time.time()
 
-    # 1. Connect to Client
     try:
         client = get_client()
         print(f"Using Cluster: {client.dashboard_link}")
@@ -536,32 +482,21 @@ def run_feature_extraction(trenches_path, masks_path, channels, channel_indices,
         cluster = LocalCluster()
         client = cluster.get_client()
 
-    # 2. Lazy Load Data
     d_trenches = da.from_zarr(trenches_path)
     d_masks = da.from_zarr(masks_path)
-    
-    # NOTE: We do NOT slice d_masks here even if it is 5D. 
-    # We pass the full 5D chunk to the worker to avoid Zarr broadcasting errors.
-    
-    # 3. Prepare Delayed Tasks
+
     chunks_tr = d_trenches.to_delayed().ravel()
     chunks_mk = d_masks.to_delayed().ravel()
     
     chunk_sizes = d_trenches.chunks[0]
     
-    # Pre-calc resize dimensions
-    # Handle mask shape regardless of 4D/5D
-    if d_masks.ndim == 5:
-        mask_h, mask_w = d_masks.shape[-2:]
-    else:
-        mask_h, mask_w = d_masks.shape[-2:]
+    mask_h, mask_w = d_masks.shape[-2:]
         
     new_size = (mask_w, mask_h) if upscale else None
     
     tasks = []
     current_id = 0
     
-    # Safe iteration
     for tr_delay, mk_delay, c_size in zip(chunks_tr, chunks_mk, chunk_sizes):
         
         task = dask.delayed(worker_extract_from_chunk)(
@@ -578,11 +513,8 @@ def run_feature_extraction(trenches_path, masks_path, channels, channel_indices,
 
     print(f"Generated {len(tasks)} tasks (Chunks). Computing...")
 
-    # 4. Compute
     futures = client.compute(tasks)
     dask.distributed.progress(futures)
-    
-    # Gather
     results_nested = client.gather(futures)
     
     print("\nAggregating results into DataFrame...")
@@ -592,7 +524,6 @@ def run_feature_extraction(trenches_path, masks_path, channels, channel_indices,
     df = pd.DataFrame()
     if flat_results:
         df = pd.DataFrame(flat_results)
-        # Reorder columns
         cols = ['mother_id', 'timepoint']
         if 'channel' in df.columns: cols.append('channel')
         if 'intensity_raw' in df.columns: cols.append('intensity_raw')
@@ -602,7 +533,6 @@ def run_feature_extraction(trenches_path, masks_path, channels, channel_indices,
     end_time = time.time()
     elapsed = end_time - start_time
     
-    # Format time
     hours, rem = divmod(elapsed, 3600)
     minutes, seconds = divmod(rem, 60)
     print(f"Extraction Complete. Time taken: {int(hours)}h {int(minutes)}m {seconds:.2f}s")
@@ -610,9 +540,10 @@ def run_feature_extraction(trenches_path, masks_path, channels, channel_indices,
     return df
     
 
-# ==============================================================================
-# 7. UNIT CONVERSION UTILITIES
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Unit conversion
+# ---------------------------------------------------------------------------
 
 def convert_px_to_microns(df, pixel_size_um, upscale):
     """Converts pixel units to microns in place."""
@@ -639,19 +570,17 @@ def reorder_dataframe(df, target_order):
     Reorders DataFrame columns: places target columns first (if they exist), 
     followed by any remaining columns.
     """
-    # Select columns that exist in the dataframe
     cols_present = [c for c in target_order if c in df.columns]
-    
-    # Find remaining columns to avoid data loss
     cols_remaining = [c for c in df.columns if c not in cols_present]
     
     print("Columns reordered.")
     return df[cols_present + cols_remaining]
 
     
-# ==============================================================================
-# 8. VISUALIZATION (MATPLOTLIB)
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Visualization (matplotlib)
+# ---------------------------------------------------------------------------
 
 def visualize_alignment(orig_data, aligned_data, mask_data, n_samples=3, trench_ids=None):
     """
@@ -661,22 +590,17 @@ def visualize_alignment(orig_data, aligned_data, mask_data, n_samples=3, trench_
     """
     n_trenches, n_times, n_channels = orig_data.shape[:3]
     
-    # 1. Select Random Samples from the provided data
-    # We sample indices (0, 1, 2...) relative to the data passed in
     if n_samples < n_trenches:
         z_indices = random.sample(range(n_trenches), n_samples)
     else:
-        # If asking for as many (or more) samples as we have data, use all of them
         z_indices = list(range(n_trenches))
         if n_samples > n_trenches:
-             # If user asked for 5 samples but we only have 3 trenches, limit to 3
              n_samples = n_trenches
 
     sample_indices = [(z, random.randint(0, n_times - 1)) for z in z_indices]
 
     print(f"Sampling {n_samples} locations...")
     
-    # 2. Gather Data
     lazy_raw = [orig_data[z, t] for z, t in sample_indices]
     lazy_aligned = [aligned_data[z, t] for z, t in sample_indices]
     lazy_masks = [mask_data[z, t, 0 if mask_data.ndim==5 else slice(None)] for z, t in sample_indices]
@@ -686,7 +610,6 @@ def visualize_alignment(orig_data, aligned_data, mask_data, n_samples=3, trench_
     else:
         comp_raw, comp_aligned, comp_masks = lazy_raw, lazy_aligned, lazy_masks
 
-    # 3. Figure Setup
     ref_h, ref_w = comp_masks[0].shape[-2:]
     aspect_ratio = ref_h / ref_w 
     plot_width = 2.0 
@@ -705,13 +628,10 @@ def visualize_alignment(orig_data, aligned_data, mask_data, n_samples=3, trench_
     
     if n_samples == 1: axes = axes[None, :] 
 
-    # 4. Plotting
     for idx, (z, t) in enumerate(sample_indices):
         mask_h, mask_w = comp_masks[idx].shape[-2:]
         mask_bool = comp_masks[idx] > 0
         
-        # --- NEW: Determine Display ID ---
-        # If trench_ids provided, look up the real ID using the relative index 'z'
         display_id = trench_ids[z] if trench_ids is not None else z
 
         for c in range(n_channels):
@@ -747,13 +667,11 @@ def visualize_background_logic(trenches_path, masks_path, channels, channel_indi
     # Default fallback
     bg_settings = bg_settings or {'buffer_from_cell': 10, 'region_height': 50, 'side_margin': 0}
 
-    # 1. Open Data
     trenches = zarr.open(trenches_path, mode='r')
     masks = zarr.open(masks_path, mode='r')
     
     n_trenches, n_frames, _, H, W = trenches.shape
     
-    # 2. Pick Random Samples
     sample_indices = []
     attempts = 0
     while len(sample_indices) < n_samples and attempts < 500:
@@ -766,7 +684,6 @@ def visualize_background_logic(trenches_path, masks_path, channels, channel_indi
         print("Could not find frames with cells.")
         return
 
-    # 3. Dynamic Figure Sizing
     ref_t, ref_f = sample_indices[0]
     ref_mask = masks[ref_t, ref_f, 0]
     ref_h, ref_w = ref_mask.shape
@@ -792,7 +709,6 @@ def visualize_background_logic(trenches_path, masks_path, channels, channel_indi
 
     for row_idx, (t_idx, f_idx) in enumerate(sample_indices):
         
-        # --- Prepare Geometry ---
         mask_frame = masks[t_idx, f_idx, 0]
         mask_h, mask_w = mask_frame.shape
         
@@ -804,32 +720,22 @@ def visualize_background_logic(trenches_path, masks_path, channels, channel_indi
         top_cell = min(props, key=lambda x: x.centroid[0])
         top_cell_mask = (labeled_mask == top_cell.label)
         
-        # --- NEW LOGIC HERE ---
-        cell_top_y = top_cell.bbox[0] 
-        
-        # Bottom of BG is 'buffer' pixels above cell
+        cell_top_y = top_cell.bbox[0]
         bg_y_bottom = max(0, int(cell_top_y) - bg_settings['buffer_from_cell'])
-        
-        # Top of BG is 'region_height' pixels above the bottom
-        # (We use max(0, ...) to ensure we don't go off the top of the image)
         bg_y_top = max(0, bg_y_bottom - bg_settings['region_height'])
         
         bg_x_left = bg_settings.get('side_margin', 0)
         bg_x_right = mask_w - bg_settings.get('side_margin', 0)
 
         bg_mask = np.zeros_like(mask_frame, dtype=bool)
-        # Create strip from top to bottom
         bg_mask[bg_y_top:bg_y_bottom, bg_x_left:bg_x_right] = True
-        # ----------------------
 
-        # --- Process Channels ---
         raw_channels_data = trenches[t_idx, f_idx]
 
         for i, ch_name in enumerate(channels):
             col_raw = i * 2
             col_ovr = i * 2 + 1
             
-            # Get Image & Resize
             img = raw_channels_data[channel_indices[ch_name]]
             if upscale:
                 img = cv2.resize(img, (mask_w, mask_h), interpolation=cv2.INTER_NEAREST)
@@ -837,7 +743,6 @@ def visualize_background_logic(trenches_path, masks_path, channels, channel_indi
             img_norm = normalize_img(img)
             img_rgb_raw = np.stack([img_norm]*3, axis=-1)
             
-            # --- Create Overlay ---
             overlay_layer = np.zeros_like(img_rgb_raw)
             overlay_layer[top_cell_mask, 0] = 1.0     
             overlay_layer[bg_mask, 1] = 0.5           
@@ -878,22 +783,16 @@ def visualize_background_logic(trenches_path, masks_path, channels, channel_indi
 
 # Background extraction
 
-def worker_bg_chunk(trench_block, mask_block, start_id, channels, channel_indices, 
+def worker_bg_chunk(trench_block, mask_block, start_id, channels, channel_indices,
                     bg_settings, upscale=False, new_size=None):
-    """
-    Worker: Extracts background intensity from a chunk of trenches.
-    """
-    # 1. Handle Dask 5D -> 4D Slicing safely
-    if mask_block.ndim == 5:
-        if mask_block.shape[2] == 1:
-            mask_block = mask_block[:, :, 0, :, :]
+    """Worker: extracts background intensity from a chunk of trenches."""
+    if mask_block.ndim == 5 and mask_block.shape[2] == 1:
+        mask_block = mask_block[:, :, 0, :, :]
 
     n_batch = trench_block.shape[0]
     n_frames = trench_block.shape[1]
-    
     results = []
-    
-    # Unpack settings
+
     buffer = bg_settings.get('buffer_from_cell', 10)
     height = bg_settings.get('region_height', 50)
     margin = bg_settings.get('side_margin', 0)
@@ -901,14 +800,13 @@ def worker_bg_chunk(trench_block, mask_block, start_id, channels, channel_indice
     for local_i in range(n_batch):
         global_id = start_id + local_i
         
-        trench_data = trench_block[local_i] # (T, C, Y, X)
-        mask_data = mask_block[local_i]     # (T, Y, X)
-        
+        trench_data = trench_block[local_i]
+        mask_data = mask_block[local_i]
+
         for t in range(n_frames):
             mask = mask_data[t]
             if not np.any(mask): continue
-            
-            # Find top of the cell stack (min row index)
+
             rows, _ = np.where(mask > 0)
             if rows.size == 0: continue
             top_cell_y = np.min(rows)
@@ -930,13 +828,10 @@ def worker_bg_chunk(trench_block, mask_block, start_id, channels, channel_indice
                 idx = channel_indices.get(ch)
                 if idx is None or idx >= trench_data.shape[1]: continue
                 
-                img = trench_data[t, idx] # (Y, X)
-                
-                # Resize if needed to match mask coordinates
+                img = trench_data[t, idx]
                 if upscale and new_size:
                     img = cv2.resize(img, new_size, interpolation=cv2.INTER_CUBIC)
                 
-                # Slice background
                 bg_roi = img[y_top:y_bot, x_L:x_R]
                 if bg_roi.size == 0: continue
                 
@@ -959,29 +854,21 @@ def run_background_extraction(trenches_path, masks_path, channels, channel_indic
     print("--- Starting Background Extraction (Dask) ---")
     start_time = time.time()
     
-    # 1. Client
     try:
         client = get_client()
         print(f"Using Cluster: {client.dashboard_link}")
     except:
         cluster = LocalCluster()
         client = cluster.get_client()
-        
-    # 2. Lazy Load
+
     d_trenches = da.from_zarr(trenches_path)
     d_masks = da.from_zarr(masks_path)
-    
-    # 3. Prepare Tasks
+
     chunks_tr = d_trenches.to_delayed().ravel()
     chunks_mk = d_masks.to_delayed().ravel()
     chunk_sizes = d_trenches.chunks[0]
-    
-    # Pre-calc dimensions
-    if d_masks.ndim == 5:
-        mask_h, mask_w = d_masks.shape[-2:]
-    else:
-        mask_h, mask_w = d_masks.shape[-2:]
-        
+
+    mask_h, mask_w = d_masks.shape[-2:]
     new_size = (mask_w, mask_h) if upscale else None
     
     tasks = []
@@ -997,13 +884,10 @@ def run_background_extraction(trenches_path, masks_path, channels, channel_indic
         
     print(f"Generated {len(tasks)} tasks. Computing...")
     
-    # 4. Compute
     futures = client.compute(tasks)
     dask.distributed.progress(futures)
-    
     results = client.gather(futures)
-    
-    # 5. Aggregate
+
     flat = [item for sub in results for item in sub]
     df_bg = pd.DataFrame(flat)
     
@@ -1038,9 +922,10 @@ def merge_background_data(df_main, df_bg):
     return merged
     
 
-# ==============================================================================
-# 9. VISUALIZATION (INTERACTIVE NAPARI FILTERING)
-# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Interactive Napari filtering
+# ---------------------------------------------------------------------------
 
 class LazilyFilteredArray:
     """
@@ -1107,15 +992,11 @@ def run_interactive_filtering(
     full_config: dict, 
     upscale: bool = True
 ) -> dict:
-    """
-    Launches Napari to tune filtering parameters.
-    Layout: Aligned Checkboxes and Sliders.
-    """
+    """Launches Napari to tune filtering parameters."""
     import napari
     from magicgui.widgets import Container, Slider, FloatSlider, PushButton, CheckBox, Label
     import sys
 
-    # 1. Load Data
     try:
         trenches_zarr = zarr.open(trenches_path, mode='r')
         masks_zarr = zarr.open(masks_path, mode='r')
@@ -1137,7 +1018,6 @@ def run_interactive_filtering(
         print(f"Error loading data: {e}")
         return {}
 
-    # 2. Setup Viewer
     scale_img, scale_mask = ((1, 1, 2, 2), (1, 1, 1, 1)) if upscale else ((1, 1, 1, 1), (1, 1, 1, 1))
     width = trenches_display.shape[-1] * scale_img[-1]
     gap = 20
@@ -1152,15 +1032,14 @@ def run_interactive_filtering(
         masks_dask_display = da.from_zarr(masks_path)
     viewer.add_labels(masks_dask_display, name='Masks (Raw)', scale=scale_mask)
 
-    # Initial Defaults (Edge Filter Default = True)
     defaults = {
         'min_area': full_config['min_area']['default'],
         'min_solidity': full_config['solidity']['default'],
         'top_limit': full_config['top_limit']['default'],
         'side_limit': full_config['side_limit']['default'],
-        'use_area': True, 
-        'use_sol': True, 
-        'edge_filter': True  # Changed to True by default
+        'use_area': True,
+        'use_sol': True,
+        'edge_filter': True,
     }
 
     lazy_filtered_masks = LazilyFilteredArray(masks_source, channel_idx=channel_fix_masks, **defaults)
@@ -1168,18 +1047,12 @@ def run_interactive_filtering(
     viewer.add_image(trenches_display, name='Filtered', scale=scale_img, translate=trans_vec, blending='additive')
     layer_filtered = viewer.add_labels(lazy_filtered_masks, name='Masks (Filtered)', scale=scale_mask, translate=trans_vec)
 
-    # Labels (Modified text)
     centers = [width / 2, width + gap + (width / 2)]
     viewer.add_points(np.array([[-20, x] for x in centers]), name='Labels', size=0, face_color='transparent', edge_color='transparent',
         text={'string': ['Original', 'Filtered'], 'color': 'white', 'size': 20, 'anchor': 'center'})
     
-    # 3. Widget Setup
     results = defaults.copy()
-
-    # --- WIDGET CREATION ---
-    LABEL_WIDTH = 110 
-
-    # Row 1: Area
+    LABEL_WIDTH = 110
     lbl_area_main = Label(value="Area Filter:")
     lbl_area_main.min_width = LABEL_WIDTH
     chk_area = CheckBox(value=True, label="")
@@ -1189,7 +1062,6 @@ def run_interactive_filtering(
     
     row1 = Container(widgets=[lbl_area_main, chk_area, lbl_area_sl, sl_area], layout="horizontal", labels=False)
 
-    # Row 2: Solidity
     lbl_sol_main = Label(value="Solidity Filter:")
     lbl_sol_main.min_width = LABEL_WIDTH
     chk_sol = CheckBox(value=True, label="")
@@ -1199,10 +1071,9 @@ def run_interactive_filtering(
     
     row2 = Container(widgets=[lbl_sol_main, chk_sol, lbl_sol_sl, sl_sol], layout="horizontal", labels=False)
 
-    # Row 3: Edge Filter
     lbl_edge_main = Label(value="Edge Filter:")
     lbl_edge_main.min_width = LABEL_WIDTH
-    chk_edge = CheckBox(value=True, label="")  # Default ticked
+    chk_edge = CheckBox(value=True, label="")
     
     lbl_top = Label(value="Top Limit (px):")
     sl_top = Slider(min=full_config['top_limit']['min'], max=full_config['top_limit']['max'], 
@@ -1214,11 +1085,9 @@ def run_interactive_filtering(
 
     row3 = Container(widgets=[lbl_edge_main, chk_edge, lbl_top, sl_top, lbl_side, sl_side], layout="horizontal", labels=False)
 
-    # Button
     w_save = PushButton(text="Finish and Save Parameters")
     w_save.native.setMinimumHeight(60)
 
-    # --- EVENTS ---
     def update_view():
         params = {
             'use_area': chk_area.value, 'min_area': sl_area.value,
@@ -1235,7 +1104,6 @@ def run_interactive_filtering(
         if params['edge_filter']: status.append(f"Edge(T{params['top_limit']}, S{params['side_limit']})")
         viewer.status = " | ".join(status) if status else "No Filters Active"
 
-    # Connect events
     for w in [chk_area, sl_area, chk_sol, sl_sol, chk_edge, sl_top, sl_side]:
         w.changed.connect(update_view)
 
@@ -1278,17 +1146,13 @@ def run_interactive_filtering(
     return results
 
 def run_comparison_viewer(trenches_path, masks_orig_path, masks_filt_path, config_path, upscale=True):
-    """
-    Opens arrays directly using Dask and Napari with Contrast Optimization.
-    """
+    """Opens original vs. filtered masks side-by-side in Napari."""
     print("Comparison Viewer: Opening...")
 
-    # 1. Open arrays using dask
     trenches_dask = da.from_zarr(trenches_path)
     masks_dask = da.from_zarr(masks_orig_path)
     masks_filtered_dask = da.from_zarr(masks_filt_path)
 
-    # Get PC channel index
     try:
         with open(config_path, "r") as f:
             config = json.load(f)
@@ -1296,14 +1160,11 @@ def run_comparison_viewer(trenches_path, masks_orig_path, masks_filt_path, confi
     except:
         PC_channel = 0
 
-    # 2. Slice the Image (Lazy)
-    # Shape: (N, T, C, Y, X) -> (N, T, Y, X)
     if trenches_dask.ndim == 5:
         trenches_channel_1 = trenches_dask[:, :, PC_channel, :, :]
     else:
         trenches_channel_1 = trenches_dask
 
-    # 3. Handle Masks dimensions (Lazy)
     if masks_dask.ndim == 5:
         masks_view = masks_dask[:, :, 0, :, :]
     else:
@@ -1314,17 +1175,12 @@ def run_comparison_viewer(trenches_path, masks_orig_path, masks_filt_path, confi
     else:
         masks_view_filtered = masks_filtered_dask
 
-    # --- PERFORMANCE FIX: Fast Contrast Limits ---
-    # Compute min/max from a SINGLE frame to prevent scanning the whole dataset
     try:
-        print("Calculated contrast limits from first frame...")
-        # Grab first trench, first timepoint
         sample_frame = trenches_channel_1[0, 0].compute()
         clims = (sample_frame.min(), sample_frame.max())
     except:
-        clims = None # Fallback
+        clims = None
 
-    # --- CALCULATE GEOMETRY ---
     size_x = trenches_channel_1.shape[-1]
     
     if upscale:
@@ -1340,32 +1196,24 @@ def run_comparison_viewer(trenches_path, masks_orig_path, masks_filt_path, confi
     shift_amount = display_width + gap
     translation_vector = (0, 0, 0, shift_amount)
 
-    # 4. Create napari viewer
     viewer = napari.Viewer()
 
-    # --- ORIGINAL ---
     viewer.add_image(
-        trenches_channel_1, 
-        name='Original Image', 
+        trenches_channel_1,
+        name='Original Image',
         scale=image_scale,
         blending='additive',
-        contrast_limits=clims  # <--- CRITICAL FIX
+        contrast_limits=clims,
     )
+    viewer.add_labels(masks_view, name='Masks (Original)', scale=mask_scale)
 
-    viewer.add_labels(
-        masks_view, 
-        name='Masks (Original)', 
-        scale=mask_scale
-    )
-
-    # --- FILTERED ---
     viewer.add_image(
-        trenches_channel_1, 
-        name='Filtered Image', 
+        trenches_channel_1,
+        name='Filtered Image',
         scale=image_scale,
         translate=translation_vector,
         blending='additive',
-        contrast_limits=clims  # <--- CRITICAL FIX
+        contrast_limits=clims,
     )
 
     viewer.add_labels(

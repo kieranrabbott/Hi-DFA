@@ -22,6 +22,10 @@ NUM_BOUNDS = {
     "nST": (0.0, 40.5),
     "a50": (10.0, 300000.0),
     "r0": (0.0, 1.0),
+    "nS": (0.0, 40.5),
+    "nT": (0.0, 40.5),
+    "KS": (1e-6, 1e6),
+    "KT": (1e-6, 1e6),
 }
 
 DEFAULT_FREE_KEYS = [
@@ -109,8 +113,12 @@ def _tolerance_penalty(
 
     for a in ages:
         for C in Cs:
-            hs = hS(C, p.kT, p.kS_kT_ratio, p.n, p.K)
-            ht = hT(C, p.kT, p.n, p.K)
+            nS_eff = p.nS if p.nS is not None else p.n
+            KS_eff = p.KS if p.KS is not None else p.K
+            nT_eff = p.nT if p.nT is not None else p.n
+            KT_eff = p.KT if p.KT is not None else p.K
+            hs = hS(C, p.kT, p.kS_kT_ratio, nS_eff, KS_eff)
+            ht = hT(C, p.kT, nT_eff, KT_eff)
 
             if hs <= 1e-12:
                 continue
