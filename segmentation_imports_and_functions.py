@@ -16,7 +16,6 @@ from tqdm import tqdm
 
 from cellpose_omni import core
 
-
 # -----------------------------------------------------------------------------
 # Quiet / spam control (important for Jupyter stability)
 # -----------------------------------------------------------------------------
@@ -101,7 +100,7 @@ def process_trench_chunk(
     input_path: str,
     output_path: str,
     lock_path: str,
-    pc_index: int,
+    channel_index: int,
     model_name: str,
     use_gpu: bool,
     orig_h: int,
@@ -116,7 +115,7 @@ def process_trench_chunk(
     synchronizer = zarr.ProcessSynchronizer(lock_path)
     out = zarr.open(output_path, mode="a", synchronizer=synchronizer)
 
-    block = inp[t0:t1, :, pc_index, :, :]  # (B, T, H, W)
+    block = inp[t0:t1, :, channel_index, :, :]
     B, T = block.shape[0], block.shape[1]
 
     model = get_model(model_name, use_gpu=use_gpu, nchan=1, nclasses=2, dim=2)
@@ -163,20 +162,22 @@ def run_segmentation(
     output_zarr_path: str,
     lock_path: str,
     config_path: str,
+    channel_to_use: str,  # <--- NEW argument
     model_name: str,
     n_jobs: int,
     output_compressor: Any,
     eval_kwargs: Dict[str, Any],
     upscale: bool = True,
     silence_worker_prints: bool = True,
+    resume: bool = False,
 ) -> RunResult:
     use_gpu = core.use_gpu()
     print(f">>> GPU activated? {use_gpu}")
 
     with open(config_path, "r") as f:
         config = json.load(f)
-    pc_idx = config["channel_indices"]["PC"]
-
+    channel_idx = config["channel_indices"][channel_to_use]
+    
     inp = zarr.open(input_zarr_path, mode="r")
     num_trenches, num_frames = inp.shape[0], inp.shape[1]
     orig_h, orig_w = inp.shape[3], inp.shape[4]
@@ -240,7 +241,7 @@ def run_segmentation(
             input_path=input_zarr_path,
             output_path=output_zarr_path,
             lock_path=lock_path,
-            pc_index=pc_idx,
+            channel_index=channel_idx,
             model_name=model_name,
             use_gpu=use_gpu,
             orig_h=orig_h,
