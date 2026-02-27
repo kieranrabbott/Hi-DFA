@@ -11,6 +11,12 @@ import os
 import datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 import copy
+import json
+
+import dask
+import dask.array as da
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from qtpy.QtCore import QTimer
 
 # =============================================================================
 # Core scientific stack
@@ -18,6 +24,7 @@ import copy
 import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
+from scipy.integrate import cumulative_trapezoid
 from tqdm.auto import tqdm
 
 # =============================================================================
@@ -25,7 +32,10 @@ from tqdm.auto import tqdm
 # =============================================================================
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import matplotlib.lines as mlines
+import matplotlib.colors as mcolors
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import seaborn as sns
 
 try:
@@ -37,9 +47,19 @@ except Exception:  # pragma: no cover
 # Optional imaging / IO deps (soft imports)
 # =============================================================================
 try:
+    import tifffile  # noqa: F401
+except Exception:  # pragma: no cover
+    tifffile = None
+
+try:
     import zarr  # noqa: F401
 except Exception:  # pragma: no cover
     zarr = None
+
+try:
+    from PIL import Image  # noqa: F401
+except Exception:  # pragma: no cover
+    Image = None
 
 try:
     from numcodecs import Blosc
@@ -52,11 +72,22 @@ try:
 except Exception:  # pragma: no cover
     Parallel = delayed = None
 
+try:
+    from pystackreg import StackReg  # noqa: F401
+except Exception:  # pragma: no cover
+    StackReg = None
 
 try:
+    from skimage import transform  # noqa: F401
+    from skimage.transform import resize  # noqa: F401
+except Exception:  # pragma: no cover
+    transform = resize = None
+
+try:
+    from scipy.ndimage import gaussian_filter  # noqa: F401
     from scipy.ndimage import binary_dilation
 except Exception:  # pragma: no cover
-    binary_dilation = None
+    gaussian_filter = None
 
 # =============================================================================
 # Optional GUI deps (soft imports; required only for interactive functions/classes)
@@ -279,11 +310,15 @@ def classify_points(
     hard_min: float,
     gated_min: float,
     gate_len: int,
-    spike_fc_up: float,   # CHANGED
-    spike_fc_down: float, # CHANGED
+    spike_fc_up: float,
+    spike_fc_down: float,
     spike_gap: int,
     max_grad: float,
     grad_gap: int,
+    use_hard: bool = True,   # NEW
+    use_gated: bool = True,  # NEW
+    use_spike: bool = True,  # NEW
+    use_grad: bool = True,   # NEW
 ) -> np.ndarray:
     """
     Classifies points into:
@@ -298,101 +333,104 @@ def classify_points(
     lin_len = np.exp(log_len)
     times = df["time"].to_numpy(dtype=float)
 
-    thresh_hard = np.log(hard_min)
-    thresh_gated = np.log(gated_min)
-
     n = len(df)
     status = np.zeros(n, dtype=int)
 
     # 1) Hard filter
-    hard_mask = log_area < thresh_hard
-    status[hard_mask] = 1
+    if use_hard:
+        thresh_hard = np.log(hard_min)
+        hard_mask = log_area < thresh_hard
+        status[hard_mask] = 1
 
-    # 2) Gate start index
-    is_above_gated = log_area >= thresh_gated
-    gate_start_idx = n
-    gate_len = int(gate_len)
+    # 2) Gated filter
+    if use_gated:
+        thresh_gated = np.log(gated_min)
+        is_above_gated = log_area >= thresh_gated
+        gate_start_idx = n
+        gate_len = int(gate_len)
 
-    if gate_len <= 1:
-        gate_start_idx = 0
-    elif n >= gate_len:
-        kernel = np.ones(gate_len, dtype=int)
-        counts = np.convolve(is_above_gated.astype(int), kernel, mode="valid")
-        matches = np.where(counts == gate_len)[0]
-        if matches.size:
-            gate_start_idx = int(matches[0])
+        if gate_len <= 1:
+            gate_start_idx = 0
+        elif n >= gate_len:
+            kernel = np.ones(gate_len, dtype=int)
+            counts = np.convolve(is_above_gated.astype(int), kernel, mode="valid")
+            matches = np.where(counts == gate_len)[0]
+            if matches.size:
+                gate_start_idx = int(matches[0])
 
-    # 3) Gated filter
-    if gate_start_idx < n:
-        gated_fail_mask = ~is_above_gated
-        time_mask = np.arange(n) >= gate_start_idx
-        mask_to_reject = gated_fail_mask & time_mask & (status != 1)
-        status[mask_to_reject] = 2
+        if gate_start_idx < n:
+            gated_fail_mask = ~is_above_gated
+            time_mask = np.arange(n) >= gate_start_idx
+            # Only mark as Gated (2) if not already Hard (1)
+            mask_to_reject = gated_fail_mask & time_mask & (status != 1)
+            status[mask_to_reject] = 2
 
-    # 4) Spike filter (asymmetric up/down check)
-    valid_idx = np.where(status == 0)[0]
-    spike_gap = int(spike_gap)
-
-    if valid_idx.size >= 3:
-        i = 1
-        while i < valid_idx.size - 1:
-            curr_idx = valid_idx[i]
-            prev_idx = valid_idx[i - 1]
-
-            fold_up = lin_len[curr_idx] / lin_len[prev_idx]
-            
-            # Check Up Threshold
-            if fold_up >= spike_fc_up:
-                search_end = min(valid_idx.size, i + 1 + spike_gap)
-                found_down = False
-
-                for k in range(i + 1, search_end):
-                    future_idx = valid_idx[k]
-                    fold_down = lin_len[future_idx] / lin_len[curr_idx]
-                    
-                    # Check Down Threshold (Reciprocal)
-                    if fold_down <= (1.0 / spike_fc_down):
-                        status[valid_idx[i:k]] = 3
-                        i = k
-                        found_down = True
-                        break
-
-                if not found_down:
-                    i += 1
-            else:
-                i += 1
-
-    # 5) Gradient filter (iterative)
-    grad_gap = int(grad_gap)
-    while True:
+    # 3) Spike filter (asymmetric up/down check)
+    if use_spike:
         valid_idx = np.where(status == 0)[0]
-        if valid_idx.size < 2:
-            break
+        spike_gap = int(spike_gap)
 
-        L = valid_idx[:-1]
-        R = valid_idx[1:]
-        gap = R - L
-        ok_pair = gap <= grad_gap
-        if not np.any(ok_pair):
-            break
+        if valid_idx.size >= 3:
+            i = 1
+            while i < valid_idx.size - 1:
+                curr_idx = valid_idx[i]
+                prev_idx = valid_idx[i - 1]
 
-        t_L = times[L[ok_pair]]
-        t_R = times[R[ok_pair]]
-        y_L = log_len[L[ok_pair]]
-        y_R = log_len[R[ok_pair]]
+                fold_up = lin_len[curr_idx] / lin_len[prev_idx]
+                
+                # Check Up Threshold
+                if fold_up >= spike_fc_up:
+                    search_end = min(valid_idx.size, i + 1 + spike_gap)
+                    found_down = False
 
-        dt = t_R - t_L
-        dy = y_R - y_L
+                    for k in range(i + 1, search_end):
+                        future_idx = valid_idx[k]
+                        fold_down = lin_len[future_idx] / lin_len[curr_idx]
+                        
+                        # Check Down Threshold (Reciprocal)
+                        if fold_down <= (1.0 / spike_fc_down):
+                            status[valid_idx[i:k]] = 3
+                            i = k
+                            found_down = True
+                            break
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            slopes = dy / dt
+                    if not found_down:
+                        i += 1
+                else:
+                    i += 1
 
-        bad = slopes > max_grad
-        if not np.any(bad):
-            break
+    # 4) Gradient filter (iterative)
+    if use_grad:
+        grad_gap = int(grad_gap)
+        while True:
+            valid_idx = np.where(status == 0)[0]
+            if valid_idx.size < 2:
+                break
 
-        indices_to_remove = L[ok_pair][bad]
-        status[indices_to_remove] = 4
+            L = valid_idx[:-1]
+            R = valid_idx[1:]
+            gap = R - L
+            ok_pair = gap <= grad_gap
+            if not np.any(ok_pair):
+                break
+
+            t_L = times[L[ok_pair]]
+            t_R = times[R[ok_pair]]
+            y_L = log_len[L[ok_pair]]
+            y_R = log_len[R[ok_pair]]
+
+            dt = t_R - t_L
+            dy = y_R - y_L
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                slopes = dy / dt
+
+            bad = slopes > max_grad
+            if not np.any(bad):
+                break
+
+            indices_to_remove = L[ok_pair][bad]
+            status[indices_to_remove] = 4
 
     return status
 
@@ -439,9 +477,15 @@ if _HAS_GUI:
                 "line": p[7],
             }
 
-        def update_plot(self, df, hard, gated, glen, s_fc_up, s_fc_down, s_gap, g_max, g_gap):
+        def update_plot(self, df, hard, gated, glen, s_fc_up, s_fc_down, s_gap, g_max, g_gap, 
+                        use_hard, use_gated, use_spike, use_grad):
             self.ax.clear()
-            st = classify_points(df, hard, gated, int(glen), s_fc_up, s_fc_down, int(s_gap), g_max, int(g_gap))
+            
+            # Pass new flags to classify_points
+            st = classify_points(
+                df, hard, gated, int(glen), s_fc_up, s_fc_down, int(s_gap), g_max, int(g_gap),
+                use_hard=use_hard, use_gated=use_gated, use_spike=use_spike, use_grad=use_grad
+            )
 
             df_acc = df.iloc[st == 0]
             if not df_acc.empty:
@@ -469,7 +513,16 @@ if _HAS_GUI:
                 3: "Spike filter",
                 4: "Gradient filter",
             }
-            for code, label in labels.items():
+            
+            # Only show legends for filters that are active
+            active_codes = []
+            if use_hard: active_codes.append(1)
+            if use_gated: active_codes.append(2)
+            if use_spike: active_codes.append(3)
+            if use_grad: active_codes.append(4)
+
+            for code in active_codes:
+                label = labels[code]
                 sub = df.iloc[st == code]
                 if not sub.empty:
                     self.ax.scatter(
@@ -705,8 +758,9 @@ def run_interactive_filtering(df: pd.DataFrame, config: Mapping[str, Mapping[str
     dock_plot = viewer.window.add_dock_widget(plot_canvas, area="top", name="Trace Analysis")
     dock_plot.widget().setMinimumHeight(600)
 
-    # Dictionary to hold the final parameters
+    # Final params dict, default booleans to True
     final_params = {k: v["default"] for k, v in config.items()}
+    final_params.update({"use_hard": True, "use_gated": True, "use_spike": True, "use_grad": True})
 
     # --- GUI FIX HELPER ---
     def fix_widget_focus(mg_widget, step=None, decimals=2):
@@ -727,7 +781,6 @@ def run_interactive_filtering(df: pd.DataFrame, config: Mapping[str, Mapping[str
                     spinner.setDecimals(decimals)
         except Exception as e:
             print(f"Note: GUI fix failed for {mg_widget.label}: {e}")
-    # ----------------------
 
     def make_float(key, lbl, dec=2):
         w = FloatSlider(
@@ -751,43 +804,70 @@ def run_interactive_filtering(df: pd.DataFrame, config: Mapping[str, Mapping[str
         fix_widget_focus(w, step=int(config[key]["step"]))
         return w
 
-    # Create Widgets
+    # --- 1. Create Widgets ---
+    
+    # Checkboxes
+    chk_hard = CheckBox(value=True, label="") # Row 1
+    chk_gated = CheckBox(value=True, label="") # Row 2
+    chk_spike = CheckBox(value=True, label="") # Row 3
+    # Row 4 is skipped (spike_down)
+    chk_grad = CheckBox(value=True, label="") # Row 5
+
+    # Sliders
     w_hard = make_float("hard_min", "Hard Min Area", dec=2)
     w_gated = make_float("gated_min", "Gated Min Area", dec=2)
     w_gate_len = make_int("gate_len", "Gate Length")
-    
     w_spike_up = make_float("spike_fc_up", "Spike FC (Up)", dec=1)
     w_spike_down = make_float("spike_fc_down", "Spike FC (Down)", dec=1)
     w_spike_gap = make_int("spike_gap", "Spike Time Gap")
-    
     w_grad_max = make_float("grad_max", "Max Gradient", dec=3)
     w_grad_gap = make_int("grad_gap", "Grad Check Gap")
 
-    # FIXED TEXT HERE
     w_save = PushButton(text="Finish and Save Parameters")
     w_save.native.setMinimumHeight(100)
 
-    # --- UPDATED LAYOUT ---
+    # --- 2. LAYOUT ---
+    
+    # Column 0: Checkboxes (Far Left)
+    c0 = Container(
+        widgets=[
+            chk_hard,       # Aligns with w_hard
+            chk_gated,      # Aligns with w_gated
+            chk_spike,      # Aligns with w_spike_up
+            Label(value=""),# Spacer for w_spike_down row
+            chk_grad        # Aligns with w_grad_max
+        ],
+        layout="vertical"
+    )
+
+    # Column 1: Main Parameters (Original c1)
     c1 = Container(
         widgets=[w_hard, w_gated, w_spike_up, w_spike_down, w_grad_max], 
         layout="vertical"
     )
+    
+    # Column 2: Secondary Parameters (Original c2)
     c2 = Container(
         widgets=[
-            Label(value=""),      
+            Label(value=""), # Spacer for w_hard
             w_gate_len,           
             w_spike_gap,          
-            Label(value=""),      
+            Label(value=""), # Spacer for w_spike_down     
             w_grad_gap            
         ], 
         layout="vertical"
     )
+    
+    # Column 3: Save Button
     c3 = Container(widgets=[Label(value=""), w_save], layout="vertical")
     
-    main_c = Container(widgets=[c1, c2, c3], layout="horizontal")
-    # ----------------------
+    # Combine Columns
+    main_c = Container(widgets=[c0, c1, c2, c3], layout="horizontal")
 
-    all_widgets = [w_hard, w_gated, w_gate_len, w_spike_up, w_spike_down, w_spike_gap, w_grad_max, w_grad_gap]
+    all_widgets = [
+        chk_hard, chk_gated, chk_spike, chk_grad,
+        w_hard, w_gated, w_gate_len, w_spike_up, w_spike_down, w_spike_gap, w_grad_max, w_grad_gap
+    ]
 
     def update():
         idx = viewer.dims.current_step[0]
@@ -795,6 +875,16 @@ def run_interactive_filtering(df: pd.DataFrame, config: Mapping[str, Mapping[str
             mid = all_moms[int(idx)]
             data = get_trace_data(df, mid)
             if not data.empty:
+                # Optional: Disable sliders if checkbox is off
+                w_hard.enabled = chk_hard.value
+                w_gated.enabled = chk_gated.value
+                w_gate_len.enabled = chk_gated.value
+                w_spike_up.enabled = chk_spike.value
+                w_spike_down.enabled = chk_spike.value
+                w_spike_gap.enabled = chk_spike.value
+                w_grad_max.enabled = chk_grad.value
+                w_grad_gap.enabled = chk_grad.value
+
                 plot_canvas.update_plot(
                     data,
                     w_hard.value,
@@ -805,6 +895,11 @@ def run_interactive_filtering(df: pd.DataFrame, config: Mapping[str, Mapping[str
                     w_spike_gap.value,
                     w_grad_max.value,
                     w_grad_gap.value,
+                    # Pass booleans
+                    chk_hard.value,
+                    chk_gated.value,
+                    chk_spike.value,
+                    chk_grad.value
                 )
             viewer.status = f"Mother ID: {mid} | Index: {int(idx)+1}/{n_moms}"
 
@@ -815,12 +910,24 @@ def run_interactive_filtering(df: pd.DataFrame, config: Mapping[str, Mapping[str
     @w_save.clicked.connect
     def save():
         print("\n" + "=" * 40 + "\n PARAMETERS SAVED\n" + "=" * 40)
-        keys = ["hard_min", "gated_min", "gate_len", "spike_fc_up", "spike_fc_down", "spike_gap", "grad_max", "grad_gap"]
         
-        for k, w in zip(keys, all_widgets):
+        # Save Sliders
+        keys = ["hard_min", "gated_min", "gate_len", "spike_fc_up", "spike_fc_down", "spike_gap", "grad_max", "grad_gap"]
+        slider_widgets = [w_hard, w_gated, w_gate_len, w_spike_up, w_spike_down, w_spike_gap, w_grad_max, w_grad_gap]
+        for k, w in zip(keys, slider_widgets):
             val = w.value
             print(f"{k.upper():<15} = {val:.3f}" if isinstance(val, float) else f"{k.upper():<15} = {val}")
             final_params[k] = val
+        
+        # Save Booleans
+        bool_keys = ["use_hard", "use_gated", "use_spike", "use_grad"]
+        bool_widgets = [chk_hard, chk_gated, chk_spike, chk_grad]
+        print("-" * 20)
+        for k, w in zip(bool_keys, bool_widgets):
+            val = w.value
+            print(f"{k.upper():<15} = {val}")
+            final_params[k] = val
+
         print("=" * 40 + "\n")
         viewer.close()
 
@@ -837,7 +944,7 @@ def run_interactive_filtering(df: pd.DataFrame, config: Mapping[str, Mapping[str
 def run_batch_cleaning(df_main: pd.DataFrame, params: Mapping[str, Any]) -> pd.DataFrame:
     """
     Applies cleaning classification to all mothers; sets log_length_cleaned to NaN for rejected points.
-    Updated for separate spike up/down thresholds.
+    Updated for separate spike up/down thresholds and enable/disable flags.
     """
     print("Step 1: Preparing Data and Applying Filters...")
     df_main = df_main.sort_values(["mother_id", "time"]).reset_index(drop=True)
@@ -845,17 +952,30 @@ def run_batch_cleaning(df_main: pd.DataFrame, params: Mapping[str, Any]) -> pd.D
     df_main["log_length_cleaned"] = df_main["log_length"]
     status = np.zeros(len(df_main), dtype=int)
 
+    # Extract flags, defaulting to True if missing
+    use_hard = params.get("use_hard", True)
+    use_gated = params.get("use_gated", True)
+    use_spike = params.get("use_spike", True)
+    use_grad = params.get("use_grad", True)
+    
+    print(f"Active Filters: Hard={use_hard}, Gated={use_gated}, Spike={use_spike}, Grad={use_grad}")
+
     for _, group in tqdm(df_main.groupby("mother_id"), desc="Processing Growth Trace Cleaning"):
         st = classify_points(
             group,
             params["hard_min"],
             params["gated_min"],
             params["gate_len"],
-            params["spike_fc_up"],   # New
-            params["spike_fc_down"], # New
+            params["spike_fc_up"],   
+            params["spike_fc_down"], 
             params["spike_gap"],
             params["grad_max"],
             params["grad_gap"],
+            # Pass new flags
+            use_hard=use_hard,
+            use_gated=use_gated,
+            use_spike=use_spike,
+            use_grad=use_grad
         )
         status[group.index.to_numpy()] = st
 
@@ -865,7 +985,6 @@ def run_batch_cleaning(df_main: pd.DataFrame, params: Mapping[str, Any]) -> pd.D
 
     print(f"Cleaning Complete. {int(rejected.sum())} points removed.")
     return df_main
-
 
 def generate_pdf_report(df_main: pd.DataFrame, filename: str) -> None:
     """
@@ -1446,201 +1565,246 @@ def evaluate_growth(
     t2: float,
     min_divs: int,
     max_nan_pct: float,
+    min_mean_gr_window: float,
+    min_mean_gr_total: float,
     global_timepoints: np.ndarray = None, 
-) -> Tuple[bool, int, float]:
+) -> Tuple[bool, bool, bool, int, float, float, float, float]:
     """
-    Returns (is_growing, n_divs_in_window, nan_pct_in_window).
-    
-    A timepoint is considered 'NaN' (missing) if:
-      1. The row is completely missing (based on global_timepoints).
-      2. The row exists but has NaN in log_length_cleaned, growth_rate, or second_deriv.
+    Returns:
+      (is_growing_overall, window_pass, total_pass, n_divs, win_nan_pct, tot_nan_pct, win_mean_gr, tot_mean_gr)
     """
-    # 1. Determine Expected Timepoints
+    # 1. Setup Global Expectations
     if global_timepoints is None:
-        # Fallback if not provided (though batch/interactive should always provide it)
-        expected_times = df["time"].unique()
+        global_timepoints = np.sort(df["time"].unique())
+        
+    # --- WINDOW CALCULATIONS ---
+    # Expected in Window
+    mask_win_exp = (global_timepoints >= t1) & (global_timepoints <= t2)
+    exp_times_win = global_timepoints[mask_win_exp]
+    n_exp_win = len(exp_times_win)
+    
+    # Actual in Window
+    df_win = df[(df["time"] >= t1) & (df["time"] <= t2)]
+    
+    if n_exp_win > 0:
+        # Missing
+        n_pres_win = len(df_win)
+        n_miss_win = n_exp_win - n_pres_win
+        
+        # Bad Data (NaNs present)
+        c_len = 'log_length_cleaned'
+        is_bad_win = df_win[c_len].isna() if c_len in df_win.columns else pd.Series(True, index=df_win.index)
+        if 'growth_rate' in df_win.columns: is_bad_win = is_bad_win | df_win['growth_rate'].isna()
+        
+        n_bad_pres_win = is_bad_win.sum()
+        win_nan_pct = ((n_miss_win + n_bad_pres_win) / n_exp_win) * 100.0
     else:
-        # Filter global times to window
-        mask_exp = (global_timepoints >= t1) & (global_timepoints <= t2)
-        expected_times = global_timepoints[mask_exp]
+        win_nan_pct = 100.0
+
+    # Divisions (Window)
+    n_divs = int(df_win["division_event"].sum()) if 'division_event' in df_win.columns else 0
+
+    # Mean GR (Window)
+    win_mean_gr = 0.0
+    if 'growth_rate_smoothed' in df_win.columns:
+        w_gr = df_win['growth_rate_smoothed'].dropna()
+        if not w_gr.empty:
+            win_mean_gr = float(w_gr.mean())
+
+    # --- TOTAL CALCULATIONS ---
+    # Expected Total
+    n_exp_tot = len(global_timepoints)
+    
+    if n_exp_tot > 0:
+        # Missing
+        n_pres_tot = len(df)
+        n_miss_tot = n_exp_tot - n_pres_tot
         
-    n_expected = len(expected_times)
-    if n_expected == 0:
-        return False, 0, 100.0
-
-    # 2. Get Actual Data in Window
-    window = df[(df["time"] >= t1) & (df["time"] <= t2)]
-    
-    # 3. Calculate Missing Rows
-    present_times = window["time"].values
-    n_present = len(present_times)
-    n_missing = n_expected - n_present
-    
-    # 4. Count Explicit NaNs in Present Rows
-    # Check Length
-    c_len = 'log_length_cleaned'
-    is_bad = window[c_len].isna() if c_len in window.columns else pd.Series(True, index=window.index)
-    
-    # Check Growth Rate
-    c_gr = 'growth_rate'
-    if c_gr in window.columns:
-        is_bad = is_bad | window[c_gr].isna()
+        # Bad Data (NaNs present)
+        is_bad_tot = df[c_len].isna() if c_len in df.columns else pd.Series(True, index=df.index)
+        if 'growth_rate' in df.columns: is_bad_tot = is_bad_tot | df['growth_rate'].isna()
         
-    # Check Second Derivative
-    c_d2 = 'second_deriv'
-    if c_d2 not in window.columns:
-        if '2nd_deriv' in window.columns: c_d2 = '2nd_deriv'
-    
-    if c_d2 in window.columns:
-        is_bad = is_bad | window[c_d2].isna()
-        
-    n_bad_present = is_bad.sum()
-    
-    # 5. Total Bad Points (Missing + Explicit NaN)
-    total_bad = n_missing + n_bad_present
-    nan_pct = (total_bad / n_expected) * 100.0
-    
-    # 6. Count Divisions
-    n_divs = int(window["division_event"].sum()) if 'division_event' in window.columns else 0
+        n_bad_pres_tot = is_bad_tot.sum()
+        tot_nan_pct = ((n_miss_tot + n_bad_pres_tot) / n_exp_tot) * 100.0
+    else:
+        tot_nan_pct = 100.0
 
-    # Decision
-    is_growing = (n_divs >= int(min_divs)) and (nan_pct <= float(max_nan_pct))
+    # Mean GR (Total)
+    tot_mean_gr = 0.0
+    if 'growth_rate_smoothed' in df.columns:
+        t_gr = df['growth_rate_smoothed'].dropna()
+        if not t_gr.empty:
+            tot_mean_gr = float(t_gr.mean())
     
-    return is_growing, n_divs, nan_pct
+    # --- EVALUATE ---
+    
+    # Path A: Window Check
+    window_pass = (
+        (n_divs >= int(min_divs)) and 
+        (win_nan_pct <= float(max_nan_pct)) and 
+        (win_mean_gr >= float(min_mean_gr_window))
+    )
+    
+    # Path B: Total Check
+    total_pass = (
+        (tot_nan_pct <= float(max_nan_pct)) and 
+        (tot_mean_gr >= float(min_mean_gr_total))
+    )
+    
+    is_growing_overall = window_pass or total_pass
+    
+    return is_growing_overall, window_pass, total_pass, n_divs, win_nan_pct, tot_nan_pct, win_mean_gr, tot_mean_gr
 
 
-def launch_interactive_growth_testing(df: Optional[pd.DataFrame], t1, t2, config) -> Optional[Dict]:
-    """
-    Wrapper to launch the interactive growth tuner.
-    """
-    if df is not None and 'division_event' in df.columns:
-        return run_growth_testing(df, t1, t2, config)
-    print("Skipping: Load data with 'division_event' first.")
-    return None
-
-def run_growth_testing(
+def launch_interactive_growth_testing(
     df: pd.DataFrame, 
     t1: float, 
     t2: float, 
     config: Mapping[str, Mapping[str, Any]]
 ) -> Dict[str, Any]:
     """
-    Napari-based interactive tuning for growth classification.
+    Napari-based interactive tuning for 'growing_before' classification.
     """
-    if not _HAS_GUI:
-        raise ImportError("Growth testing requires napari + qtpy + magicgui installed.")
+    try:
+        req_min_divs = config["min_divs"]
+        req_max_nan = config["max_nan_pct"]
+        req_min_gr_win = config["min_mean_growth_rate_window"]
+        req_min_gr_tot = config["min_mean_growth_rate_total"]
+    except KeyError as e:
+        raise KeyError(f"Missing required key in GROWTH_BEFORE_CONFIG: {e}")
 
-    # Filter for candidates
+    if not _HAS_GUI: 
+        print("Napari not installed/available. Returning defaults.")
+        return {
+            "t1": t1, "t2": t2,
+            "min_division_events": req_min_divs["default"],
+            "max_missing_timepoints_fraction": req_max_nan["default"],
+            "min_mean_growth_rate_window": req_min_gr_win["default"] / 100.0,
+            "min_mean_growth_rate_total": req_min_gr_tot["default"] / 100.0,
+        }
+
+    if 'division_event' not in df.columns: raise ValueError("Error: 'division_event' column missing.")
+    
     if "at_start" in df.columns:
         candidates = sorted(df[df["at_start"] == True]["mother_id"].unique())
     else:
         candidates = sorted(df["mother_id"].unique())
-
+        
     n_moms = len(candidates)
     if n_moms == 0: return {}
 
     y_vals = df["log_length_cleaned"].dropna()
-    global_y_max = np.ceil(np.percentile(y_vals, [99.5])[0] * 2) / 2
-    
-    # Global Timepoints
+    global_y_max = np.ceil(np.percentile(y_vals, [99.5])[0] * 2) / 2 if not y_vals.empty else 5
     global_tps = np.sort(df["time"].unique())
     global_x_max = global_tps.max() if len(global_tps) > 0 else 600
 
-    print(f"Loaded {n_moms} traces.")
-    print(f"Checking Window: {t1} min -> {t2} min")
+    print(f"Checking Pre-Treatment Window: {t1} min -> {t2} min")
 
     viewer = napari.Viewer(title="Growth Classification Testing")
     viewer.add_image(np.zeros((n_moms, 1, 1)), name="Navigator", opacity=0.0)
     try:
         viewer.window.qt_viewer.dockLayerList.setVisible(False)
         viewer.window.qt_viewer.dockLayerControls.setVisible(False)
-    except Exception:
-        pass
+    except Exception: pass
 
+    # --- Plotter ---
     class GrowthPlotter(FigureCanvasQTAgg):
         def __init__(self, width=12, height=6, dpi=100, x_max=1000, y_max=5):
             sns.set_theme(style="ticks", context="talk")
             self.fig = Figure(figsize=(width, height), dpi=dpi)
             self.ax = self.fig.add_subplot(111)
-            self.fig.subplots_adjust(left=0.08, right=0.98, top=0.85, bottom=0.15)
+            self.fig.subplots_adjust(left=0.08, right=0.98, top=0.78, bottom=0.15)
             super().__init__(self.fig)
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.x_max, self.y_max = x_max, y_max
             self.COLOR_TRACE = sns.color_palette("tab10")[0]
-            self.COLOR_DIV = "#2ca02c"
 
-        def update_plot(self, df, t1, t2, min_divs, max_nan_pct, x_max_limit, global_tps):
+        def update_plot(self, df, t1, t2, min_divs, max_nan_pct, min_gr_win, min_gr_tot, x_max_limit, global_tps):
             self.ax.clear()
 
-            is_growing, n_divs, nan_pct = evaluate_growth(
-                df, t1, t2, min_divs, max_nan_pct, 
+            is_growing, win_pass, tot_pass, n_divs, win_nan_pct, tot_nan_pct, win_mean_gr, tot_mean_gr = evaluate_growth(
+                df, t1, t2, min_divs, max_nan_pct, min_gr_win, min_gr_tot,
                 global_timepoints=global_tps
             )
 
-            self.ax.axvspan(t1, t2, color="gold", alpha=0.15, zorder=0, label="Check Window")
+            # Draw Trace & Window
+            self.ax.axvspan(t1, t2, color="gold", alpha=0.15, zorder=0)
             self.ax.plot(df["time"], df["log_length_cleaned"], c=self.COLOR_TRACE, lw=2, alpha=0.8)
 
+            # Draw Divisions
             divs = df[df["division_event"] == True]
             if not divs.empty:
-                in_window = divs[(divs["time"] >= t1) & (divs["time"] <= t2)]
-                out_window = divs[(divs["time"] < t1) | (divs["time"] > t2)]
+                in_win = divs[(divs["time"] >= t1) & (divs["time"] <= t2)]
+                if not in_win.empty:
+                    self.ax.scatter(in_win["time"], in_win["log_length_cleaned"], c="#2ca02c", s=120, marker="v", zorder=5, edgecolors="k")
 
-                if not in_window.empty:
-                    self.ax.scatter(in_window["time"], in_window["log_length_cleaned"], c=self.COLOR_DIV, s=120, marker="v", zorder=5, edgecolors="k")
-                if not out_window.empty:
-                    self.ax.scatter(out_window["time"], out_window["log_length_cleaned"], c="gray", s=60, marker="v", zorder=4, alpha=0.5)
+            # --- 4-ROW TITLE ---
+            C_PASS, C_FAIL, C_GREY, C_TEXT = "#2ca02c", "#d62728", "gray", "black"
+            c_main = C_PASS if is_growing else C_FAIL
+            c_win  = C_PASS if win_pass else C_GREY
+            c_tot  = C_PASS if tot_pass else C_GREY
 
-            status_text = "GROWING" if is_growing else "NOT GROWING"
-            status_color = "#2ca02c" if is_growing else "#d62728"
-
-            title_str = (
-                f"Mother ID: {df['mother_id'].iloc[0]}\n"
-                f"Status: {status_text}  |  Divs in Window: {n_divs} (Req: {min_divs})  |  "
-                f"Bad Pts (NaN+Miss): {nan_pct:.1f}% (Max: {max_nan_pct}%)"
-            )
-
-            # Format axis
-            self.ax.set_xlim(0, x_max_limit)
-            self.ax.xaxis.set_major_locator(ticker.MultipleLocator(120))
-            self.ax.xaxis.set_minor_locator(ticker.MultipleLocator(60))
+            # Values (x100)
+            win_disp = win_mean_gr * 100
+            tot_disp = tot_mean_gr * 100
             
-            self.ax.set_title(title_str, color=status_color, fontweight="bold", fontsize=14, pad=10)
-            self.ax.set_ylabel("ln(Length)", fontweight="bold")
-            self.ax.set_xlabel("Time (min)", fontweight="bold")
-            self.ax.set_ylim(0, self.y_max)
-            self.ax.grid(True, linestyle="--", alpha=0.5)
-            self.ax.legend(loc="lower left", frameon=True, fontsize=10)
+            # Text Lines
+            txt_r1 = f"Mother ID: {df['mother_id'].iloc[0]}  |  Status: {'GROWING' if is_growing else 'NOT GROWING'}"
+            txt_r2 = f"Divisions: {n_divs}  |  Window NaN: {win_nan_pct:.1f}%  |  Total Check NaN: {tot_nan_pct:.1f}%  (Max {max_nan_pct}%)"
+            
+            w_status = "PASS" if win_pass else "FAIL"
+            # Format: GR: val (req >= req, x10^-2)
+            txt_r3 = f"Window Check: {w_status}  |  Window Mean GR: {win_disp:.2f} (req >= {min_gr_win*100:.2f}, x10^-2)"
+            
+            t_status = "PASS" if tot_pass else "FAIL"
+            txt_r4 = f"Total Check: {t_status}     |  Total Mean GR: {tot_disp:.2f} (req >= {min_gr_tot*100:.2f}, x10^-2)"
 
-            sns.despine(ax=self.ax)
+            # Y-Coords (approx 0.06 spacing)
+            self.ax.text(0.5, 1.22, txt_r1, transform=self.ax.transAxes, ha='center', va='bottom', fontsize=12, fontweight='bold', color=c_main)
+            self.ax.text(0.5, 1.16, txt_r2, transform=self.ax.transAxes, ha='center', va='bottom', fontsize=9, color=C_TEXT)
+            self.ax.text(0.5, 1.10, txt_r3, transform=self.ax.transAxes, ha='center', va='bottom', fontsize=9, fontweight='bold', color=c_win)
+            self.ax.text(0.5, 1.04, txt_r4, transform=self.ax.transAxes, ha='center', va='bottom', fontsize=9, fontweight='bold', color=c_tot)
+
+            self.ax.set_xlim(0, x_max_limit)
+            self.ax.set_ylim(0, self.y_max)
+            self.ax.xaxis.set_major_locator(ticker.MultipleLocator(120))
+            self.ax.grid(True, linestyle="--", alpha=0.5)
             self.draw()
 
     plotter = GrowthPlotter(x_max=global_x_max, y_max=global_y_max)
-    dock_plot = viewer.window.add_dock_widget(plotter, area="top", name="Growth Analysis")
-    dock_plot.widget().setMinimumHeight(500)
+    viewer.window.add_dock_widget(plotter, area="top", name="Growth Analysis")
 
-    final_growth_params = {
-        "t1": t1, "t2": t2,
-        "min_division_events": config["min_divs"]["default"],
-        "max_missing_timepoints_fraction": config["max_nan_pct"]["default"],
-    }
-
-    w_min_divs = Slider(min=config["min_divs"]["min"], max=config["min_divs"]["max"], step=config["min_divs"]["step"], value=config["min_divs"]["default"], label="Min Division Events")
-    w_max_nan = FloatSlider(min=config["max_nan_pct"]["min"], max=config["max_nan_pct"]["max"], step=config["max_nan_pct"]["step"], value=config["max_nan_pct"]["default"], label="Max % Bad (NaN+Miss)")
+    # Controls
+    w_min_divs = Slider(min=req_min_divs["min"], max=req_min_divs["max"], step=req_min_divs["step"], value=req_min_divs["default"], label="Min Divs (Window Only)")
+    w_max_nan = FloatSlider(min=req_max_nan["min"], max=req_max_nan["max"], step=req_max_nan["step"], value=req_max_nan["default"], label="Max Bad %")
+    w_min_gr_win = FloatSlider(min=req_min_gr_win["min"], max=req_min_gr_win["max"], step=req_min_gr_win["step"], value=req_min_gr_win["default"], label="Window Min GR (x10^-2)")
+    w_min_gr_tot = FloatSlider(min=req_min_gr_tot["min"], max=req_min_gr_tot["max"], step=req_min_gr_tot["step"], value=req_min_gr_tot["default"], label="Total Min GR (x10^-2)")
 
     def fix_focus(w):
         try:
             from qtpy.QtCore import Qt
-            from qtpy.QtWidgets import QAbstractSlider
+            from qtpy.QtWidgets import QAbstractSlider, QDoubleSpinBox
             for s in w.native.findChildren(QAbstractSlider): s.setFocusPolicy(Qt.StrongFocus)
+            for s in w.native.findChildren(QDoubleSpinBox): s.setDecimals(2)
         except: pass
-    fix_focus(w_min_divs); fix_focus(w_max_nan)
+    
+    for w in [w_min_divs, w_max_nan, w_min_gr_win, w_min_gr_tot]: fix_focus(w)
 
     w_save = PushButton(text="Finish and Save Parameters")
-    w_save.native.setMinimumHeight(80)
+    w_save.native.setMinimumHeight(60)
 
-    col1 = Container(widgets=[w_min_divs, w_max_nan], layout="vertical")
-    col2 = Container(widgets=[Label(value=""), w_save], layout="vertical")
-    main_c = Container(widgets=[col1, col2], layout="horizontal")
+    c1 = Container(widgets=[w_min_divs, w_max_nan], layout="vertical")
+    c2 = Container(widgets=[w_min_gr_win, w_min_gr_tot], layout="vertical")
+    c3 = Container(widgets=[Label(value=""), w_save], layout="vertical")
+    main_c = Container(widgets=[c1, c2, c3], layout="horizontal")
+    
+    final_params = {
+        "t1": t1, "t2": t2,
+        "min_division_events": req_min_divs["default"],
+        "max_missing_timepoints_fraction": req_max_nan["default"],
+        "min_mean_growth_rate_window": req_min_gr_win["default"] / 100.0,
+        "min_mean_growth_rate_total": req_min_gr_tot["default"] / 100.0
+    }
 
     x_max_limit = np.ceil(global_x_max / 120) * 120
 
@@ -1652,22 +1816,23 @@ def run_growth_testing(
             plotter.update_plot(
                 trace, t1, t2, 
                 w_min_divs.value, w_max_nan.value, 
+                w_min_gr_win.value / 100.0, w_min_gr_tot.value / 100.0,
                 x_max_limit, global_tps
             )
             viewer.status = f"Mother {mid} ({int(idx)+1}/{n_moms})"
 
-    w_min_divs.changed.connect(update)
-    w_max_nan.changed.connect(update)
+    for w in [w_min_divs, w_max_nan, w_min_gr_win, w_min_gr_tot]: w.changed.connect(update)
     viewer.dims.events.current_step.connect(lambda e: update())
 
     @w_save.clicked.connect
     def save():
-        final_growth_params.update({
-            "t1": t1, "t2": t2,
+        final_params.update({
             "min_division_events": w_min_divs.value,
             "max_missing_timepoints_fraction": w_max_nan.value,
+            "min_mean_growth_rate_window": w_min_gr_win.value / 100.0,
+            "min_mean_growth_rate_total": w_min_gr_tot.value / 100.0
         })
-        print(f"Growth Params Saved: {final_growth_params}")
+        print(f"Growing Before Params Saved: {final_params}")
         viewer.close()
 
     viewer.window.add_dock_widget(main_c, area="bottom", name="Criteria Controls")
@@ -1675,32 +1840,21 @@ def run_growth_testing(
     update()
     viewer.window.qt_viewer.window().showMaximized()
     napari.run()
-    
-    return final_growth_params
+    return final_params
 
-def _process_growth_batch(mid, group, t1, t2, min_divs, max_nan_pct, global_timepoints):
-    """
-    Worker function for parallel growth classification.
-    Explicitly accepts 'mid' (mother_id) to avoid AttributeError on group.name.
-    """
+def _process_growth_batch(mid, group, t1, t2, min_divs, max_nan_pct, min_gr_win, min_gr_tot, global_timepoints):
     try:
-        # We perform the check on the group (mother trace)
         calc_trace = group.drop_duplicates(subset=["time"])
-        
-        is_growing, _, _ = evaluate_growth(
-            calc_trace, t1, t2, min_divs, max_nan_pct, 
+        # Only unpack the first return value (is_growing)
+        is_growing = evaluate_growth(
+            calc_trace, t1, t2, min_divs, max_nan_pct, min_gr_win, min_gr_tot,
             global_timepoints=global_timepoints
-        )
-        
+        )[0]
         return mid, is_growing
     except Exception:
-        # On error, assume False to be safe
         return mid, False
 
 def execute_batch_growth_classification(df_main: pd.DataFrame, params: dict) -> pd.DataFrame:
-    """
-    Classifies 'growing_before' status using parallel processing.
-    """
     if df_main is None: return None
     if not params: raise ValueError("Error: growth_params missing.")
 
@@ -1710,44 +1864,32 @@ def execute_batch_growth_classification(df_main: pd.DataFrame, params: dict) -> 
     df_main = df_main.sort_values(["mother_id", "time"]).reset_index(drop=True)
     df_main["growing_before"] = False
 
-    t1 = params["t1"]
-    t2 = params["t2"]
-    min_divs = params["min_division_events"]
-    max_nan = params["max_missing_timepoints_fraction"]
+    t1, t2 = params["t1"], params["t2"]
+    min_divs, max_nan = params["min_division_events"], params["max_missing_timepoints_fraction"]
+    min_gr_win = params.get("min_mean_growth_rate_window", -100.0)
+    min_gr_tot = params.get("min_mean_growth_rate_total", -100.0)
     
-    # 1. Establish Global Timepoints
+    print(f"Criteria Window: Divs>={min_divs}, NaN<{max_nan}%, GR>={min_gr_win}")
+    print(f"Criteria Total:  NaN<{max_nan}%, GR>={min_gr_tot} (Divs ignored)")
+    
     global_tps = np.sort(df_main["time"].unique())
-    
-    # 2. Identify Candidates
-    if "at_start" in df_main.columns:
-        candidates = df_main.loc[df_main["at_start"] == True, "mother_id"].unique()
-    else:
-        candidates = df_main["mother_id"].unique()
+    candidates = df_main.loc[df_main["at_start"] == True, "mother_id"].unique() if "at_start" in df_main.columns else df_main["mother_id"].unique()
         
     print(f"Processing {len(candidates)} mother_ids in window [{t1}, {t2}]...")
     
-    candidate_mask = df_main["mother_id"].isin(candidates)
-    grouped = df_main.loc[candidate_mask].groupby("mother_id")
-    
-    # 3. Parallel Execution
+    grouped = df_main.loc[df_main["mother_id"].isin(candidates)].groupby("mother_id")
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_growth_batch)(mid, group, t1, t2, min_divs, max_nan, global_tps)
-        for mid, group in tqdm(grouped, desc="Classifying growing_before", total=len(candidates))
+        delayed(_process_growth_batch)(mid, group, t1, t2, min_divs, max_nan, min_gr_win, min_gr_tot, global_tps)
+        for mid, group in tqdm(grouped, desc="Classifying", total=len(candidates))
     )
     
-    # 4. Aggregate
     growing_moms = [mid for mid, is_growing in results if is_growing]
-    
-    # 5. Update DataFrame
     df_main.loc[df_main["mother_id"].isin(growing_moms), "growing_before"] = True
 
     n_growing = len(growing_moms)
-    total = len(candidates)
-    print(f"Classification Complete. {n_growing}/{total} ({(n_growing/total if total else 0):.1%}) mothers classified as Growing.")
-    print(f"{'='*40}\n DONE \n{'='*40}")
+    print(f"Classification Complete. {n_growing}/{len(candidates)} classified as Growing.")
     
     return df_main
-
 
 # =============================================================================
 # 5) Background intensity histograms + filtering impact
@@ -3815,12 +3957,13 @@ def _run_lowess(t, y, frac):
     else:
         return y
 
-def apply_smoothing_pipeline(df_trace, window_size=20, window_early=20, early_limit=0.0):
+def apply_smoothing_pipeline(df_trace, window_size=20, window_early=20, early_limit=0.0, start_flat=0.0):
     """
-    Pipeline: Flatten -> Dual LOWESS (Early/Late) -> Blend -> Unflatten.
-    Assumes df_trace is already sorted by time for maximum efficiency.
+    Pipeline: Flatten -> Pre-process Flat Start -> Dual LOWESS -> Enforce Flat Start -> Unflatten.
+    
+    New Argument:
+      start_flat (float): Time (min) from start where growth is forced to be flat (median of region).
     """
-    # OPTIMIZATION: Removed strict sorting here, relying on pre-sorted input
     t = df_trace["time"].values
     y_raw = df_trace["log_length_cleaned"].values
     divs = df_trace["division_event"].fillna(False).values
@@ -3829,13 +3972,29 @@ def apply_smoothing_pipeline(df_trace, window_size=20, window_early=20, early_li
     # 1. Flatten
     y_flat_raw, shifts = flatten_trace_by_divisions(t, y_raw, divs)
     
-    # 2. Dual LOWESS Strategy
+    # --- STEP 1.5: Handle Flat Start (Input Modification) ---
+    # We modify the input to LOWESS so the smooth curve naturally approaches the flat value
+    y_input_for_lowess = y_flat_raw.copy()
+    flat_mask = (t <= start_flat)
+    flat_median = None
+    
+    if start_flat > 0 and flat_mask.any():
+        # Calculate median of the FLATTENED data in this region
+        valid_pts = y_flat_raw[flat_mask]
+        valid_pts = valid_pts[np.isfinite(valid_pts)]
+        
+        if len(valid_pts) > 0:
+            flat_median = np.median(valid_pts)
+            # Overwrite input data for LOWESS with this median to guide the smoother
+            y_input_for_lowess[flat_mask] = flat_median
+
+    # 2. Dual LOWESS Strategy (Using modified input)
     frac_main = min(1.0, max(0.01, window_size / n_points)) if n_points > 0 else 0.1
-    y_smooth_main = _run_lowess(t, y_flat_raw, frac_main)
+    y_smooth_main = _run_lowess(t, y_input_for_lowess, frac_main)
 
     if early_limit > 0 and window_early is not None and n_points > 0:
         frac_early = min(1.0, max(0.01, window_early / n_points))
-        y_smooth_early = _run_lowess(t, y_flat_raw, frac_early)
+        y_smooth_early = _run_lowess(t, y_input_for_lowess, frac_early)
         
         # 3. Blend Curves
         blend_width = 25.0 
@@ -3848,11 +4007,17 @@ def apply_smoothing_pipeline(df_trace, window_size=20, window_early=20, early_li
         y_smooth_cont = y_smooth_main
         used_frac = (frac_main, None)
         
+    # --- STEP 3.5: Enforce Flat Start (Output Constraint) ---
+    # Strictly force the output to be the median value in the flat region
+    # (Fixes any minor wiggles LOWESS might have left)
+    if flat_median is not None:
+        y_smooth_cont[flat_mask] = flat_median
+        
     # 4. Unflatten
     y_fit = unflatten_trace(y_smooth_cont, shifts)
     
     return t, y_raw, y_fit, y_flat_raw, y_smooth_cont, divs, used_frac
-
+    
 # =============================================================================
 # Helper for Parallel Execution
 # =============================================================================
@@ -3939,7 +4104,7 @@ if _HAS_GUI:
                 div_y = y_raw[divs]
                 self.ax_fit.scatter(div_t, div_y, c=C_DIV, s=40, zorder=10)
 
-            title_str = f"Final Fit | Main: {w_main} pts"
+            title_str = f"Mother ID: {mid} | Final Fit | Main: {w_main} pts"
             if t_lim > 0:
                 title_str += f" | Early: {w_early} pts (<{t_lim} min)"
             
@@ -4009,31 +4174,39 @@ if _HAS_GUI:
         plotter = SmoothingPlotter(zoom_xlims=zoom_xlims)
         viewer.window.add_dock_widget(plotter, area="top", name="Smoothing Plots")
         
+        # Config Defaults
         cfg_win = config.get('lowess_window', {'min': 5, 'max': 200, 'step': 1, 'default': 20})
         cfg_early = config.get('lowess_window_early', {'min': 5, 'max': 200, 'step': 1, 'default': 20})
         cfg_lim = config.get('early_time_lim', {'min': 0, 'max': 1000, 'step': 10, 'default': 0})
+        cfg_flat = config.get('start_flat', {'min': 0, 'max': 300, 'step': 5, 'default': 0})
         
+        # Widgets
         w_window = IntSlider(
             min=cfg_win['min'], max=cfg_win['max'], step=cfg_win['step'], 
-            value=cfg_win['default'], label="LOWESS Window (timepoints)"
+            value=cfg_win['default'], label="LOWESS Window (points)"
         )
         w_win_early = IntSlider(
             min=cfg_early['min'], max=cfg_early['max'], step=cfg_early['step'], 
-            value=cfg_early['default'], label="LOWESS Window EARLY (timepoints)"
+            value=cfg_early['default'], label="LOWESS Window EARLY"
         )
         w_lim_early = FloatSlider(
             min=cfg_lim['min'], max=cfg_lim['max'], step=cfg_lim['step'], 
-            value=cfg_lim['default'], label="Early time limit (mins)"
+            value=cfg_lim['default'], label="Early Time Limit (min)"
+        )
+        w_start_flat = FloatSlider(
+            min=cfg_flat['min'], max=cfg_flat['max'], step=cfg_flat['step'], 
+            value=cfg_flat['default'], label="Force Flat Start (min)"
         )
         
-        fix_widget_focus(w_window)
-        fix_widget_focus(w_win_early)
-        fix_widget_focus(w_lim_early)
+        # Fix Focus
+        for w in [w_window, w_win_early, w_lim_early, w_start_flat]:
+            fix_widget_focus(w)
         
         w_save = PushButton(text="Finish and Save Parameters")
         w_save.native.setMinimumHeight(60)
         
-        row1 = Container(widgets=[w_window], layout="horizontal", labels=True)
+        # Layout
+        row1 = Container(widgets=[w_window, w_start_flat], layout="horizontal", labels=True)
         row2 = Container(widgets=[w_win_early, w_lim_early], layout="horizontal", labels=True)
         main_container = Container(widgets=[row1, row2, Label(value=""), w_save])
         viewer.window.add_dock_widget(main_container, area="bottom", name="Controls")
@@ -4041,30 +4214,39 @@ if _HAS_GUI:
         final_params = {
             'lowess_window': cfg_win['default'],
             'lowess_window_early': cfg_early['default'],
-            'early_time_lim': cfg_lim['default']
+            'early_time_lim': cfg_lim['default'],
+            'start_flat': cfg_flat['default']
         }
 
         def update():
             idx = viewer.dims.current_step[0]
             if idx < n_moms:
                 mid = candidates[int(idx)]
-                trace = df[df["mother_id"] == mid].sort_values("time") # Ensure sorted for interactive view
+                trace = df[df["mother_id"] == mid].sort_values("time")
                 
                 win_main = w_window.value
                 win_early = w_win_early.value
                 t_lim = w_lim_early.value
+                t_flat = w_start_flat.value
                 
                 t, y_raw, y_fit, y_flat_raw, y_smooth_cont, divs, fracs = apply_smoothing_pipeline(
-                    trace, window_size=win_main, window_early=win_early, early_limit=t_lim
+                    trace, window_size=win_main, window_early=win_early, early_limit=t_lim, start_flat=t_flat
                 )
                 
                 plotter.update_plot(
                     mid, t, y_raw, y_fit, y_flat_raw, y_smooth_cont, divs, fracs, 
                     w_main=win_main, w_early=win_early, t_lim=t_lim
                 )
+                
+                # Visualize the Flat Cutoff in the plotter
+                if t_flat > 0:
+                    plotter.ax_flat.axvline(t_flat, color='green', linestyle='--', alpha=0.5, label='Flat Cutoff')
+                    plotter.ax_fit.axvline(t_flat, color='green', linestyle='--', alpha=0.5)
+                    plotter.draw()
+                    
                 viewer.status = f"Mother {mid} ({int(idx)+1}/{n_moms})"
 
-        for w in [w_window, w_win_early, w_lim_early]:
+        for w in [w_window, w_win_early, w_lim_early, w_start_flat]:
             w.changed.connect(update)
             
         viewer.dims.events.current_step.connect(lambda e: update())
@@ -4074,7 +4256,8 @@ if _HAS_GUI:
             final_params['lowess_window'] = w_window.value
             final_params['lowess_window_early'] = w_win_early.value
             final_params['early_time_lim'] = w_lim_early.value
-            print(f"Saved Params:\n  Main Window: {final_params['lowess_window']}\n  Early Window: {final_params['lowess_window_early']}\n  Early Limit: {final_params['early_time_lim']}")
+            final_params['start_flat'] = w_start_flat.value
+            print(f"Saved Params:\n  Main Window: {final_params['lowess_window']}\n  Early Window: {final_params['lowess_window_early']}\n  Early Limit: {final_params['early_time_lim']}\n  Start Flat: {final_params['start_flat']}")
             viewer.close()
 
         viewer.dims.set_current_step(0, 0)
@@ -4090,14 +4273,14 @@ if _HAS_GUI:
 
 import multiprocessing
 
-def _process_single_trace(group, win_main, win_early, t_lim):
+def _process_single_trace(group, win_main, win_early, t_lim, start_flat):
     """
     Worker function for parallel processing.
     Runs the pipeline on a single group and returns the result Series.
     """
     try:
         _, _, y_fit, _, _, _, _ = apply_smoothing_pipeline(
-            group, window_size=win_main, window_early=win_early, early_limit=t_lim
+            group, window_size=win_main, window_early=win_early, early_limit=t_lim, start_flat=start_flat
         )
         return pd.Series(y_fit, index=group.index, dtype="float64")
     except Exception:
@@ -4105,10 +4288,7 @@ def _process_single_trace(group, win_main, win_early, t_lim):
 
 def execute_batch_smoothing(df_main: pd.DataFrame, params: dict) -> pd.DataFrame:
     """
-    Applies the Flatten -> Dual LOWESS -> Unflatten pipeline to all mothers
-    where at_start == True.
-    
-    OPTIMIZATION: Uses joblib for parallel processing.
+    Applies the Flatten -> Dual LOWESS -> Unflatten pipeline to all mothers.
     """
     if df_main is None: return None
     
@@ -4116,53 +4296,44 @@ def execute_batch_smoothing(df_main: pd.DataFrame, params: dict) -> pd.DataFrame
     win_main = params.get('lowess_window', 20)
     win_early = params.get('lowess_window_early', 20)
     t_lim = params.get('early_time_lim', 0)
+    start_flat = params.get('start_flat', 0.0)
     
-    # Determine CPU cores (leave one free to keep system responsive)
+    # Determine CPU cores
     n_jobs = max(1, multiprocessing.cpu_count() - 1)
     
     print(f"{'='*40}\n STARTING BATCH SMOOTHING (Parallel n_jobs={n_jobs}) \n{'='*40}")
     print(f"  Main Window:  {win_main} pts")
     print(f"  Early Window: {win_early} pts")
     print(f"  Early Limit:  {t_lim} mins")
+    print(f"  Start Flat:   {start_flat} mins")
     
-    # Pre-sort to ensure consistent ordering (crucial for time-series ops)
-    # We sort once here so groups are likely sorted, though the pipeline enforces it too.
     df_main = df_main.sort_values(["mother_id", "time"]).reset_index(drop=True)
     
-    # Initialize output column
     if 'log_length_smoothed' not in df_main.columns:
         df_main['log_length_smoothed'] = np.nan
     
-    # Identify candidates
     if "at_start" in df_main.columns:
-        # Boolean indexing is faster than query
         candidates = df_main.loc[df_main["at_start"] == True, "mother_id"].unique()
     else:
         candidates = df_main["mother_id"].unique()
         
     print(f"Processing {len(candidates)} mother_ids...")
     
-    # Create groups generator (only for candidates)
-    # Note: We filter df_main first to avoid grouping the entire massive dataframe
     candidate_mask = df_main["mother_id"].isin(candidates)
     grouped = df_main.loc[candidate_mask].groupby("mother_id")
     
     # Execute Parallel Loop
-    # We pass the groups directly to delayed()
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_single_trace)(group, win_main, win_early, t_lim)
+        delayed(_process_single_trace)(group, win_main, win_early, t_lim, start_flat)
         for _, group in tqdm(grouped, desc="Smoothing growth traces", total=len(candidates))
     )
     
-    # Collect non-None results
+    # Collect results
     valid_results = [res for res in results if res is not None]
     
     if valid_results:
         print("Concatenating results...")
         combined_updates = pd.concat(valid_results)
-        
-        # Efficient update: align indices
-        # We use .loc with the index from the combined series to update the main DF
         df_main.loc[combined_updates.index, 'log_length_smoothed'] = combined_updates
         
     print(f"{'='*40}\n DONE \n{'='*40}")
@@ -4700,12 +4871,12 @@ def _calc_deriv_and_smooth(t, y, window_size):
         
     return deriv_raw, deriv_smooth, frac
 
-def apply_derivative_pipeline(df_trace, win_d1=20, win_d2=20):
+def apply_derivative_pipeline(df_trace, win_d1=20, win_d2=20, start_flat=0.0):
     """
     Pipeline: 
     1. Flatten log_length_smoothed (to remove division drops).
-    2. Calc D1 (Growth Rate) -> Smooth.
-    3. Calc D2 -> Smooth.
+    2. Calc D1 (Growth Rate) -> Smooth -> Enforce 0 if t <= start_flat.
+    3. Calc D2 -> Smooth -> Enforce 0 if t <= start_flat.
     """
     # Sort to ensure time consistency
     df_trace = df_trace.sort_values("time").copy()
@@ -4732,12 +4903,21 @@ def apply_derivative_pipeline(df_trace, win_d1=20, win_d2=20):
     # 2. First Derivative
     d1_raw, d1_smooth, frac1 = _calc_deriv_and_smooth(t, y_flat, win_d1)
     
+    # --- Enforce Flat Start on D1 ---
+    if start_flat > 0:
+        d1_smooth[t <= start_flat] = 0.0
+
     # 3. Second Derivative
+    # Note: We calculate D2 from the *already enforced* D1, but smoothing might smear the step.
     d2_raw, d2_smooth, frac2 = _calc_deriv_and_smooth(t, d1_smooth, win_d2)
+    
+    # --- Enforce Flat Start on D2 ---
+    if start_flat > 0:
+        d2_smooth[t <= start_flat] = 0.0
     
     # Return full 't' array alongside data
     return t, y_input, y_raw_cleaned, d1_raw, d1_smooth, d2_raw, d2_smooth, divs, frac1, frac2
-
+    
 # =============================================================================
 # Interactive Viewer (Derivatives)
 # =============================================================================
@@ -4888,8 +5068,18 @@ if _HAS_GUI:
                  return None
 
         # --- CALCULATE GLOBAL MAX TIME ---
-        # This ensures every plot shares the same full X-range
         global_max_time = df["time"].max() if "time" in df.columns else 600
+
+        # --- GET START_FLAT FROM CONFIG ---
+        # Assuming config (e.g. DERIVATIVE_CONFIG) contains 'start_flat' key 
+        # or the user manually merged it.
+        sf_param = config.get('start_flat', 0.0)
+        if isinstance(sf_param, dict):
+             start_flat_val = sf_param.get('default', 0.0)
+        else:
+             start_flat_val = float(sf_param)
+
+        print(f"Loaded {n_moms} traces. Start Flat enforced at t <= {start_flat_val} min.")
 
         viewer = napari.Viewer(title="Derivative Smoothing Testing")
         viewer.add_image(np.zeros((n_moms, 1, 1)), name="Navigator", opacity=0.0)
@@ -4930,7 +5120,8 @@ if _HAS_GUI:
         
         final_params = {
             'lowess_window_first_deriv': p_d1['default'],
-            'lowess_window_second_deriv': p_d2['default']
+            'lowess_window_second_deriv': p_d2['default'],
+            'start_flat': start_flat_val # Pass this through
         }
 
         def update():
@@ -4943,11 +5134,18 @@ if _HAS_GUI:
                 win2 = w_win_d2.value
                 
                 t, y_input, y_raw_c, d1_raw, d1_smooth, d2_raw, d2_smooth, divs, _, _ = apply_derivative_pipeline(
-                    trace, win_d1=win1, win_d2=win2
+                    trace, win_d1=win1, win_d2=win2, start_flat=start_flat_val
                 )
                 
-                # Pass GLOBAL max time here
                 plotter.update_plot(mid, t, y_input, y_raw_c, d1_raw, d1_smooth, d2_raw, d2_smooth, divs, win1, win2, global_max_time)
+                
+                # Visualise start_flat cutoff
+                if start_flat_val > 0:
+                    for ax in [plotter.ax_d1, plotter.ax_d2]:
+                        ax.axvline(start_flat_val, color='green', linestyle='--', alpha=0.5)
+                        # Re-draw happens inside update_plot usually, but calling draw() again is safe
+                    plotter.draw()
+                    
                 viewer.status = f"Mother {mid} ({int(idx)+1}/{n_moms})"
 
         w_win_d1.changed.connect(update)
@@ -4969,12 +5167,11 @@ if _HAS_GUI:
         return final_params
         
 
-def _process_deriv_trace(group, win_d1, win_d2):
+def _process_deriv_trace(group, win_d1, win_d2, start_flat):
     """Worker for derivative calculation."""
     try:
-        # Note: Added 'divs' to unpacking
         _, _, _, _, d1_smooth, _, d2_smooth, _, _, _ = apply_derivative_pipeline(
-            group, win_d1=win_d1, win_d2=win_d2
+            group, win_d1=win_d1, win_d2=win_d2, start_flat=start_flat
         )
         return pd.DataFrame({
             'growth_rate': d1_smooth,
@@ -4982,7 +5179,7 @@ def _process_deriv_trace(group, win_d1, win_d2):
         }, index=group.index)
     except Exception:
         return None
-
+        
 def execute_batch_derivative_smoothing(df_main: pd.DataFrame, params: dict) -> pd.DataFrame:
     """
     Calculates smoothed 1st and second derivatives for all 'at_start' mothers.
@@ -4992,12 +5189,14 @@ def execute_batch_derivative_smoothing(df_main: pd.DataFrame, params: dict) -> p
     
     win_d1 = params.get('lowess_window_first_deriv', 20)
     win_d2 = params.get('lowess_window_second_deriv', 20)
+    start_flat = params.get('start_flat', 0.0) # Extract param
     
     n_jobs = max(1, multiprocessing.cpu_count() - 1)
     
     print(f"{'='*40}\n STARTING BATCH DERIVATIVES (Parallel n_jobs={n_jobs}) \n{'='*40}")
     print(f"  Window 1st Deriv: {win_d1} pts")
     print(f"  Window second Deriv: {win_d2} pts")
+    print(f"  Start Flat: {start_flat} mins")
     
     df_main = df_main.sort_values(["mother_id", "time"]).reset_index(drop=True)
     df_main['growth_rate'] = np.nan
@@ -5014,7 +5213,7 @@ def execute_batch_derivative_smoothing(df_main: pd.DataFrame, params: dict) -> p
     grouped = df_main.loc[candidate_mask].groupby("mother_id")
     
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_deriv_trace)(group, win_d1, win_d2)
+        delayed(_process_deriv_trace)(group, win_d1, win_d2, start_flat) # Pass param
         for _, group in tqdm(grouped, desc="Calculating derivatives", total=len(candidates))
     )
     
@@ -5074,9 +5273,10 @@ def _clean_and_smooth(t, raw_data, min_thresh, max_thresh, adj_points, window_si
 def apply_derivative_cleanup_pipeline(df_trace, 
                                       d1_min=0.0, d1_max=None, d1_adj=1, 
                                       d2_min=-0.00025, d2_max=None, d2_adj=1,
-                                      win_d1=20, win_d2=20):
+                                      win_d1=20, win_d2=20, start_flat=0.0):
     """
     Pipeline: Flatten -> Calc D1 -> Clean D1 (Min/Max) -> Smooth D1 -> Calc D2 -> Clean D2 (Min/Max) -> Smooth D2.
+    Added: start_flat (enforces 0 in [0, start_flat] for smooth derivatives).
     """
     df_trace = df_trace.sort_values("time").copy()
     t = df_trace["time"].values
@@ -5101,9 +5301,17 @@ def apply_derivative_cleanup_pipeline(df_trace,
     d1_raw_initial = np.gradient(y_flat, t)
     d1_clean, d1_smooth = _clean_and_smooth(t, d1_raw_initial, d1_min, d1_max, d1_adj, win_d1)
     
+    # --- Enforce Flat Start D1 ---
+    if start_flat > 0:
+        d1_smooth[t <= start_flat] = 0.0
+    
     # 4. D2: Calc (from D1 Smooth) -> Clean -> Smooth
     d2_raw_initial = np.gradient(d1_smooth, t)
     d2_clean, d2_smooth = _clean_and_smooth(t, d2_raw_initial, d2_min, d2_max, d2_adj, win_d2)
+    
+    # --- Enforce Flat Start D2 ---
+    if start_flat > 0:
+        d2_smooth[t <= start_flat] = 0.0
     
     # 5. Generate Combined Outlier Mask
     mask = np.isnan(d1_clean) | np.isnan(d2_clean)
@@ -5129,10 +5337,9 @@ if _HAS_GUI:
             super().__init__(self.fig)
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             
-        def update_plot(self, mid, t, y_smooth, y_raw, d1_raw, d1_clean, d1_smooth, d2_raw, d2_clean, d2_smooth, divs, global_max_time):
+        def update_plot(self, mid, t, y_smooth, y_raw, d1_raw, d1_clean, d1_smooth, d2_raw, d2_clean, d2_smooth, divs, global_max_time, start_flat):
             self.ax_len.clear(); self.ax_d1.clear(); self.ax_d2.clear()
 
-            # Limits
             x_max_limit = np.ceil(global_max_time / 120) * 120
             major_ticks = np.arange(0, x_max_limit + 1, 120)
             minor_ticks = np.arange(0, x_max_limit + 1, 60)
@@ -5150,7 +5357,6 @@ if _HAS_GUI:
             self.ax_len.scatter(t, y_raw, c=point_colors, s=point_sizes, alpha=0.5, label='Raw')
             self.ax_len.plot(t, y_smooth, c=C_FIT_RED, lw=2, label='Smoothed Input')
             
-            # Highlight divisions
             if divs.any():
                 self.ax_len.scatter(t[divs], y_raw[divs], c=C_DIV, s=20, alpha=1.0, zorder=10)
 
@@ -5166,14 +5372,12 @@ if _HAS_GUI:
             self.ax_d1.scatter(t[excluded_mask], d1_raw[excluded_mask], c=C_EXCLUDED, marker='x', s=20, alpha=0.8, label='Removed')
             self.ax_d1.plot(t, d1_smooth, c=C_SMOOTH_1, lw=2, label='Re-Smoothed')
             
-            # Highlight divisions on D1
             if divs.any():
                 self.ax_d1.scatter(t[divs], d1_raw[divs], c=C_DIV, s=20, alpha=1.0, zorder=10)
 
             self.ax_d1.set_title("1st Derivative Cleanup", fontweight="bold")
             self.ax_d1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
             self.ax_d1.set_ylabel("d(log L)/dt\n(x10^-2 1/min)")
-            # FIX: Auto-scale Y (Removed fixed limits)
             self.ax_d1.legend(loc="upper left", fontsize=8)
 
             # --- Plot 3: Second Derivative ---
@@ -5184,16 +5388,19 @@ if _HAS_GUI:
             self.ax_d2.scatter(t[excluded_mask_d2], d2_raw[excluded_mask_d2], c=C_EXCLUDED, marker='x', s=20, alpha=0.8, label='Removed')
             self.ax_d2.plot(t, d2_smooth, c=C_SMOOTH_2, lw=2, label='Re-Smoothed')
             
-            # Highlight divisions on D2
             if divs.any():
                 self.ax_d2.scatter(t[divs], d2_raw[divs], c=C_DIV, s=20, alpha=1.0, zorder=10)
 
             self.ax_d2.set_title("Second Derivative Cleanup", fontweight="bold")
             self.ax_d2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*10000:.1f}'))
             self.ax_d2.set_ylabel("d2/dt2\n(x10^-4 1/min2)")
-            # FIX: Auto-scale Y (Removed fixed limits)
             self.ax_d2.set_xlabel("Time (min)")
             self.ax_d2.legend(loc="upper left", fontsize=8)
+
+            # --- Visualise Start Flat ---
+            if start_flat > 0:
+                for ax in [self.ax_len, self.ax_d1, self.ax_d2]:
+                    ax.axvline(start_flat, color='green', linestyle='--', alpha=0.5, label='Start Flat')
 
             for ax in [self.ax_len, self.ax_d1, self.ax_d2]:
                 ax.set_xticks(major_ticks)
@@ -5218,6 +5425,14 @@ if _HAS_GUI:
         
         win_d1 = prev_deriv_params.get('lowess_window_first_deriv', 20)
         win_d2 = prev_deriv_params.get('lowess_window_second_deriv', 20)
+        
+        # --- EXTRACT START_FLAT ---
+        sf_param = prev_deriv_params.get('start_flat', 0.0)
+        if isinstance(sf_param, dict):
+             start_flat_val = sf_param.get('default', 0.0)
+        else:
+             start_flat_val = float(sf_param)
+        
         global_max_time = df["time"].max() if "time" in df.columns else 600
     
         viewer = napari.Viewer(title="Derivative Cleanup Tuner")
@@ -5230,59 +5445,43 @@ if _HAS_GUI:
         plotter = CleanupPlotter()
         viewer.window.add_dock_widget(plotter, area="top", name="Cleanup Plots")
         
-        # --- Configure Controls from Dictionary ---
+        # --- Configure Controls ---
         cfg_d1_min = config.get('min_d1', {'min': -5.0, 'max': 5.0, 'step': 0.1, 'default': 0.0})
         cfg_d2_min = config.get('min_d2', {'min': -5.0, 'max': 5.0, 'step': 0.1, 'default': -2.5})
-        
-        # Max Configs (Defaults: 0.4, range 0-10)
         cfg_d1_max = config.get('max_d1', {'min': 0.0, 'max': 10.0, 'step': 0.1, 'default': 0.4})
         cfg_d2_max = config.get('max_d2', {'min': 0.0, 'max': 10.0, 'step': 0.1, 'default': 0.4})
-        
         cfg_adj1 = config.get('adj_d1', {'min': 0, 'max': 5, 'step': 1, 'default': 1})
         cfg_adj2 = config.get('adj_d2', {'min': 0, 'max': 5, 'step': 1, 'default': 1})
     
-        # GUI Helpers
+        # Helpers
         def fix_widget_focus(mg_widget):
             try:
                 from qtpy.QtCore import Qt
                 from qtpy.QtWidgets import QAbstractSlider, QAbstractSpinBox
                 native = mg_widget.native
-                for slider in native.findChildren(QAbstractSlider):
-                    slider.setFocusPolicy(Qt.StrongFocus)
-                for spinner in native.findChildren(QAbstractSpinBox):
-                    spinner.setFocusPolicy(Qt.ClickFocus)
-                    spinner.setKeyboardTracking(False)
-                    if hasattr(spinner, 'lineEdit') and spinner.lineEdit():
-                        spinner.lineEdit().setFocusPolicy(Qt.ClickFocus)
+                for slider in native.findChildren(QAbstractSlider): slider.setFocusPolicy(Qt.StrongFocus)
+                for spinner in native.findChildren(QAbstractSpinBox): spinner.setFocusPolicy(Qt.ClickFocus)
             except Exception: pass
 
-        # Widgets - D1
+        # Widgets
         w_use_d1 = CheckBox(value=True, label="Enable")
         w_min_d1 = FloatSlider(min=cfg_d1_min['min'], max=cfg_d1_min['max'], step=cfg_d1_min['step'], value=cfg_d1_min['default'], label="Min 1st Deriv (x10^-2)")
         w_max_d1 = FloatSlider(min=cfg_d1_max['min'], max=cfg_d1_max['max'], step=cfg_d1_max['step'], value=cfg_d1_max['default'], label="Max 1st Deriv (x10^-2)")
         w_adj_d1 = IntSlider(min=cfg_adj1['min'], max=cfg_adj1['max'], step=cfg_adj1['step'], value=cfg_adj1['default'], label="Del Adjacent (pts)")
         
-        # Widgets - D2
         w_use_d2 = CheckBox(value=True, label="Enable")
         w_min_d2 = FloatSlider(min=cfg_d2_min['min'], max=cfg_d2_min['max'], step=cfg_d2_min['step'], value=cfg_d2_min['default'], label="Min 2nd Deriv (x10^-4)")
         w_max_d2 = FloatSlider(min=cfg_d2_max['min'], max=cfg_d2_max['max'], step=cfg_d2_max['step'], value=cfg_d2_max['default'], label="Max 2nd Deriv (x10^-4)")
         w_adj_d2 = IntSlider(min=cfg_adj2['min'], max=cfg_adj2['max'], step=cfg_adj2['step'], value=cfg_adj2['default'], label="Del Adjacent (pts)")
         
-        for w in [w_min_d1, w_max_d1, w_adj_d1, w_min_d2, w_max_d2, w_adj_d2]:
-            fix_widget_focus(w)
+        for w in [w_min_d1, w_max_d1, w_adj_d1, w_min_d2, w_max_d2, w_adj_d2]: fix_widget_focus(w)
             
         w_save = PushButton(text="Finish and Save Parameters")
         w_save.native.setMinimumHeight(60)
         
-        # Layout: 4 Rows
-        # Row 1: D1 Min Controls
         c1_a = Container(widgets=[w_use_d1, w_min_d1, w_adj_d1], layout="horizontal", labels=True)
-        # Row 2: D1 Max Control
         c1_b = Container(widgets=[Label(value=""), w_max_d1, Label(value="")], layout="horizontal", labels=True)
-        
-        # Row 3: D2 Min Controls
         c2_a = Container(widgets=[w_use_d2, w_min_d2, w_adj_d2], layout="horizontal", labels=True)
-        # Row 4: D2 Max Control
         c2_b = Container(widgets=[Label(value=""), w_max_d2, Label(value="")], layout="horizontal", labels=True)
         
         main_c = Container(widgets=[c1_a, c1_b, c2_a, c2_b, Label(value=""), w_save])
@@ -5293,11 +5492,11 @@ if _HAS_GUI:
             'min_d1': cfg_d1_min['default'] * 1e-2, 
             'max_d1': cfg_d1_max['default'] * 1e-2,
             'adj_d1': cfg_adj1['default'],
-            
             'use_d2': True, 
             'min_d2': cfg_d2_min['default'] * 1e-4, 
             'max_d2': cfg_d2_max['default'] * 1e-4,
-            'adj_d2': cfg_adj2['default']
+            'adj_d2': cfg_adj2['default'],
+            'start_flat': start_flat_val # Pass through
         }
     
         def update():
@@ -5306,10 +5505,8 @@ if _HAS_GUI:
                 mid = candidates[int(idx)]
                 trace = df[df["mother_id"] == mid]
                 
-                # Apply Enable logic
                 d1_min_val = (w_min_d1.value * 1e-2) if w_use_d1.value else None
                 d1_max_val = (w_max_d1.value * 1e-2) if w_use_d1.value else None
-                
                 d2_min_val = (w_min_d2.value * 1e-4) if w_use_d2.value else None
                 d2_max_val = (w_max_d2.value * 1e-4) if w_use_d2.value else None
                 
@@ -5317,13 +5514,12 @@ if _HAS_GUI:
                     trace, 
                     d1_min=d1_min_val, d1_max=d1_max_val, d1_adj=w_adj_d1.value,
                     d2_min=d2_min_val, d2_max=d2_max_val, d2_adj=w_adj_d2.value,
-                    win_d1=win_d1, win_d2=win_d2
+                    win_d1=win_d1, win_d2=win_d2,
+                    start_flat=start_flat_val # Pass updated param
                 )
                 
-                # Unpack 11 items
                 t, y_in, y_raw, d1_r, d1_c, d1_s, d2_r, d2_c, d2_s, divs, _ = res
-                
-                plotter.update_plot(mid, t, y_in, y_raw, d1_r, d1_c, d1_s, d2_r, d2_c, d2_s, divs, global_max_time)
+                plotter.update_plot(mid, t, y_in, y_raw, d1_r, d1_c, d1_s, d2_r, d2_c, d2_s, divs, global_max_time, start_flat_val)
                 viewer.status = f"Mother {mid} ({int(idx)+1}/{n_moms})"
     
         for w in [w_use_d1, w_min_d1, w_max_d1, w_adj_d1, w_use_d2, w_min_d2, w_max_d2, w_adj_d2]:
@@ -5362,66 +5558,62 @@ def _process_cleanup_trace(group, params, prev_deriv_params):
     try:
         win_d1 = prev_deriv_params.get('lowess_window_first_deriv', 20)
         win_d2 = prev_deriv_params.get('lowess_window_second_deriv', 20)
+        start_flat = prev_deriv_params.get('start_flat', 0.0)
+        if isinstance(start_flat, dict): start_flat = start_flat.get('default', 0.0)
         
-        # Extract Min/Max params (if use_d* is False, threshold is None to skip check)
+        # Extract Min/Max params
         d1_min = params['min_d1'] if params.get('use_d1', True) else None
         d1_max = params['max_d1'] if params.get('use_d1', True) else None
-        
         d2_min = params['min_d2'] if params.get('use_d2', True) else None
         d2_max = params['max_d2'] if params.get('use_d2', True) else None
         
+        # This pipeline ALREADY re-calculates the smoothing on valid points only
         res = apply_derivative_cleanup_pipeline(
             group,
             d1_min=d1_min, d1_max=d1_max, d1_adj=params['adj_d1'],
             d2_min=d2_min, d2_max=d2_max, d2_adj=params['adj_d2'],
-            win_d1=win_d1, win_d2=win_d2
+            win_d1=win_d1, win_d2=win_d2,
+            start_flat=start_flat
         )
         
-        # Unpack indices:
-        d1_raw = res[3]
-        d1_s   = res[5]
-        d2_raw = res[6]
-        d2_s   = res[8]
-        mask   = res[10]
+        d1_raw, d1_s = res[3], res[5]
+        d2_raw, d2_s = res[6], res[8]
+        mask = res[10]
         
-        # Apply mask to Raw traces (Filter out bad timepoints)
         d1_raw_filtered = d1_raw.copy()
         d2_raw_filtered = d2_raw.copy()
         
+        # --- MODIFIED: Apply mask ONLY to Raw traces ---
         if mask.any():
             d1_raw_filtered[mask] = np.nan
             d2_raw_filtered[mask] = np.nan
-        
-        # Return only the data columns
+                    
         return pd.DataFrame({
-            'growth_rate': d1_raw_filtered,      # Raw (Filtered)
-            'second_deriv': d2_raw_filtered,     # Raw (Filtered)
-            'growth_rate_smoothed': d1_s,        # Final Fit
-            'second_deriv_smoothed': d2_s        # Final Fit
+            'growth_rate': d1_raw_filtered,
+            'second_deriv': d2_raw_filtered,
+            'growth_rate_smoothed': d1_s,  
+            'second_deriv_smoothed': d2_s
         }, index=group.index)
     except Exception:
         return None
 
-        
 def execute_batch_derivative_cleanup(df_main: pd.DataFrame, cleanup_params: dict, prev_deriv_params: dict) -> pd.DataFrame:
     """
     Applies derivative cleanup & re-smoothing.
-    
-    Updates columns:
-      - 'growth_rate': Non-smoothed gradient of log_length, with outliers set to NaN.
-      - 'second_deriv': Non-smoothed gradient of smoothed growth_rate, with outliers set to NaN.
-      - 'growth_rate_smoothed': LOWESS smoothed growth rate.
-      - 'second_deriv_smoothed': LOWESS smoothed second derivative.
     """
     if df_main is None: return None
     
     n_jobs = max(1, multiprocessing.cpu_count() - 1)
     print(f"{'='*40}\n STARTING BATCH CLEANUP (Parallel n_jobs={n_jobs}) \n{'='*40}")
-    print(f"  Params: {cleanup_params}")
+    print(f"  Cleanup Params: {cleanup_params}")
+    
+    # Ensure start_flat is recognized for logging
+    sf = prev_deriv_params.get('start_flat', 0.0)
+    if isinstance(sf, dict): sf = sf.get('default', 0.0)
+    print(f"  Start Flat: {sf} mins")
     
     df_main = df_main.sort_values(["mother_id", "time"]).reset_index(drop=True)
     
-    # Initialize columns if not present
     cols_to_update = ['growth_rate', 'second_deriv', 'growth_rate_smoothed', 'second_deriv_smoothed']
     for col in cols_to_update:
         if col not in df_main.columns:
@@ -5447,8 +5639,6 @@ def execute_batch_derivative_cleanup(df_main: pd.DataFrame, cleanup_params: dict
     if valid_results:
         print("Concatenating results...")
         combined = pd.concat(valid_results)
-        
-        # Update DataFrame with the 4 derivative columns (excluding is_outlier)
         df_main.loc[combined.index, cols_to_update] = combined[cols_to_update]
         
     print(f"{'='*40}\n DONE \n{'='*40}")
@@ -6426,8 +6616,6 @@ def _process_slowdown_batch(group, params):
     """
     Worker function for batch processing.
     Calculates detailed slowdown metrics including cumulative lost time.
-    Note: _detect_and_measure_slowdowns now handles the "Running Reset" QC,
-    so we can trust the start/end times it returns.
     """
     try:
         trace = group.sort_values("time")
@@ -6448,7 +6636,10 @@ def _process_slowdown_batch(group, params):
         out_df = pd.DataFrame(index=trace.index)
         
         out_df['slowdown'] = False
-        out_df['slowdown_interval'] = np.array([None] * len(out_df), dtype=object)
+        # CHANGED: Separate columns instead of interval string
+        out_df['slowdown_start'] = np.nan
+        out_df['slowdown_end'] = np.nan
+        
         out_df['current_slowdown_duration'] = np.nan
         out_df['total_slowdown_duration'] = np.nan
         out_df['current_lost_time'] = np.nan
@@ -6474,8 +6665,6 @@ def _process_slowdown_batch(group, params):
             avg_height = (rate_diff[:-1] + rate_diff[1:]) / 2.0
             step_areas = avg_height * dt
             
-            # Since _detect used "Running Reset", this sum should be non-negative.
-            # We clip at 0 just to prevent -1e-16 float noise in the output CSV.
             cum_lost_profile = np.concatenate([[0.0], np.cumsum(step_areas)]) / baseline
             cum_lost_profile = np.maximum(cum_lost_profile, 0.0)
             
@@ -6483,10 +6672,11 @@ def _process_slowdown_batch(group, params):
             subset_indices = trace.index[s_idx : e_idx + 1]
             if len(subset_indices) != len(t_slice): continue
             
-            interval_str = f"{ev['start_t']:.1f}-{ev['end_t']:.1f}"
-            
             out_df.loc[subset_indices, 'slowdown'] = True
-            out_df.loc[subset_indices, 'slowdown_interval'] = interval_str
+            # CHANGED: Assign numeric start/end
+            out_df.loc[subset_indices, 'slowdown_start'] = ev['start_t']
+            out_df.loc[subset_indices, 'slowdown_end'] = ev['end_t']
+            
             out_df.loc[subset_indices, 'total_slowdown_duration'] = ev['duration']
             out_df.loc[subset_indices, 'total_lost_time'] = ev['time_lost']
             
@@ -6498,6 +6688,7 @@ def _process_slowdown_batch(group, params):
     except Exception as e:
         print(f"Error in batch processing: {e}")
         return None
+        
 
 def execute_batch_slowdown_detection(df_main: pd.DataFrame, params: dict) -> pd.DataFrame:
     """Batch execution wrapper."""
@@ -6506,9 +6697,11 @@ def execute_batch_slowdown_detection(df_main: pd.DataFrame, params: dict) -> pd.
     print(f"{'='*40}\n EXECUTING BATCH SLOWDOWN DETECTION \n{'='*40}")
     
     # 1. Initialize Columns
+    # CHANGED: Replaced 'slowdown_interval' with 'slowdown_start', 'slowdown_end'
     new_cols = [
         'slowdown', 
-        'slowdown_interval', 
+        'slowdown_start',
+        'slowdown_end',
         'current_slowdown_duration', 
         'total_slowdown_duration', 
         'current_lost_time', 
@@ -6516,9 +6709,9 @@ def execute_batch_slowdown_detection(df_main: pd.DataFrame, params: dict) -> pd.
     ]
     
     df_main['slowdown'] = False
-    df_main['slowdown_interval'] = np.array([None] * len(df_main), dtype=object)
     
-    for c in new_cols[2:]:
+    # Initialize all numeric columns with NaN
+    for c in new_cols[1:]:
         df_main[c] = np.nan
         
     # 2. Select Candidates
@@ -6557,19 +6750,350 @@ def execute_batch_slowdown_detection(df_main: pd.DataFrame, params: dict) -> pd.
     print(f"{'='*40}\n DONE \n{'='*40}")
     return df_main
     
+def generate_survivor_slowdown_pdf(
+    df: pd.DataFrame, 
+    slowdown_params: dict,
+    treatment_start: float, 
+    treatment_end: float,
+    lanes_to_check: list = None, 
+    max_IDs_per_lane: int = 50,
+    filename: str = None
+):
+    """
+    Generates a PDF report for 'Survivors' (growing_before=True AND growing_after=True).
+    Matches the 3-panel layout, but ALSO recalculates and plots the rich visual 
+    slowdown annotations (baselines, shading, and duration/lost_time labels) 
+    used in the interactive testers.
+    """
+    if df is None: return
+    
+    print(f"{'='*50}\n GENERATING SURVIVOR SLOWDOWN PDF \n{'='*50}")
+
+    # 1. Validation
+    req_cols = ['mother_id', 'growing_before', 'growing_after', 'time', 'log_length_smoothed', 'growth_rate_smoothed']
+    for c in req_cols:
+        if c not in df.columns:
+            print(f"Error: Required column '{c}' missing from DataFrame.")
+            return
+
+    # Determine second derivative column name
+    d2_col = "second_deriv_smoothed" if "second_deriv_smoothed" in df.columns else "2nd_deriv_smoothed"
+    if d2_col not in df.columns:
+        print(f"Error: Second derivative column missing.")
+        return
+
+    # 2. Identify Survivors
+    survivor_mask = (df['growing_before'] == True) & (df['growing_after'] == True)
+    survivors = df[survivor_mask]['mother_id'].unique()
+    
+    if len(survivors) == 0:
+        print("No survivors found.")
+        return
+
+    # 3. Filter by Lane (Optional)
+    if lanes_to_check is not None:
+        if 'lane' not in df.columns:
+            print("Error: 'lane' column missing, cannot filter by lane.")
+            return
+        print(f"Filtering for lanes: {lanes_to_check}")
+        lane_moms = df[df['lane'].isin(lanes_to_check)]['mother_id'].unique()
+        survivors = np.intersect1d(survivors, lane_moms)
+        
+    if len(survivors) == 0:
+        print(f"No survivors found in the specified lanes.")
+        return
+
+    # 4. Selection Logic (Max N per lane)
+    final_list = []
+    if 'lane' in df.columns:
+        meta = df[['mother_id', 'lane']].drop_duplicates().set_index('mother_id')
+        present_lanes = meta.loc[survivors, 'lane'].unique()
+        for lane in sorted(present_lanes):
+            moms_in_lane = sorted(meta[meta['lane'] == lane].index.intersection(survivors))
+            if len(moms_in_lane) > max_IDs_per_lane:
+                final_list.extend(moms_in_lane[:max_IDs_per_lane])
+            else:
+                final_list.extend(moms_in_lane)
+    else:
+        # Fallback if no lane column
+        if len(survivors) > max_IDs_per_lane:
+            final_list = sorted(survivors)[:max_IDs_per_lane]
+        else:
+            final_list = sorted(survivors)
+
+    if not final_list:
+        print("No IDs selected.")
+        return
+
+    # 5. Setup Output
+    if filename is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"survivor_slowdowns_{timestamp}.pdf"
+
+    # Global X Limit
+    x_max = df['time'].max()
+    x_limit = np.ceil(x_max / 120) * 120
+    
+    print(f"Generating PDF: {filename} ({len(final_list)} plots)...")
+
+    # 6. Plotting Loop
+    with PdfPages(filename) as pdf:
+        for mid in tqdm(final_list, desc="Plotting Survivors"):
+            trace = df[df['mother_id'] == mid].sort_values('time')
+            t = trace['time'].values
+            
+            # Extract Data
+            y_raw = trace['log_length_cleaned'].values if 'log_length_cleaned' in trace.columns else None
+            y_sm  = trace['log_length_smoothed'].values
+            d1_sm = trace['growth_rate_smoothed'].values
+            d2_sm = trace[d2_col].values
+            divs = trace["division_event"].astype(float).fillna(0).astype(bool).values if "division_event" in trace.columns else np.zeros(len(t), dtype=bool)
+
+            # Recalculate exact slowdown events for rich visualization
+            events = _detect_and_measure_slowdowns(t, d1_sm, d2_sm, params=slowdown_params)
+            valid_events = [ev for ev in events if ev.get('is_valid', True)]
+
+            # --- Layout: 3 Vertical Panels ---
+            fig, axes = plt.subplots(3, 1, figsize=(8.0, 7.0), sharex=False)
+            plt.subplots_adjust(top=0.92, bottom=0.10, left=0.12, right=0.95, hspace=0.3)
+            
+            ax_len, ax_d1, ax_d2 = axes[0], axes[1], axes[2]
+            
+            # Title Construction
+            title_parts = [f"Survivor Slowdowns: Mother {mid}"]
+            if 'lane' in trace.columns:
+                title_parts.append(f"Lane {trace['lane'].iloc[0]}")
+            if 'condition' in trace.columns:
+                title_parts.append(f"{trace['condition'].iloc[0]}")
+            
+            fig.suptitle(" | ".join(title_parts), fontweight='bold', fontsize=12)
+            
+            # --- Panel 1: Log Length ---
+            if y_raw is not None:
+                ax_len.scatter(t, y_raw, c='gray', s=10, alpha=0.3, zorder=1)
+            ax_len.plot(t, y_sm, c='#d62728', lw=2, label='Smoothed', zorder=2)
+            
+            if divs.any() and y_raw is not None:
+                valid_divs = divs & np.isfinite(y_raw)
+                ax_len.scatter(t[valid_divs], y_raw[valid_divs], c='cyan', s=30, marker='o', edgecolors='k', zorder=3, label='Division')
+                
+            ax_len.set_ylabel(r"ln[Length ($\mu$m)]", fontweight='bold')
+            ax_len.set_ylim(0.25, 3.25)
+
+            # --- Panel 2: Growth Rate ---
+            ax_d1.plot(t, d1_sm, c='#1f77b4', lw=2)
+            ax_d1.set_ylabel(r"Rate ($\times 10^{-2} min^{-1}$)", fontweight='bold')
+            ax_d1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
+            ax_d1.set_ylim(-0.001, 0.025)
+
+            # --- Panel 3: Acceleration ---
+            ax_d2.plot(t, d2_sm, c='#ff7f0e', lw=2)
+            ax_d2.axhline(0, c='k', ls='-', lw=0.8, alpha=0.5)
+            ax_d2.set_ylabel(r"Accel ($\times 10^{-4} min^{-2}$)", fontweight='bold')
+            ax_d2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*10000:.1f}'))
+            ax_d2.set_ylim(-0.00025, 0.00025)
+            ax_d2.set_xlabel("Time (min)", fontweight='bold')
+
+            # --- Apply Slowdown Highlights & Labels ---
+            for ev in valid_events:
+                mask = (t >= ev['start_t']) & (t <= ev['end_t'])
+                if not mask.any(): continue
+                
+                # 1. Background Highlight (All Panels)
+                for ax in axes:
+                    ax.axvspan(ev['start_t'], ev['end_t'], color='green', alpha=0.15, zorder=0)
+
+                # 2. Rate Panel Annotations
+                baseline = ev['baseline_gr']
+                if np.isfinite(baseline):
+                    ax_d1.plot([ev['start_t'], ev['end_t']], [baseline, baseline], color='black', linestyle='--', linewidth=1.5)
+                    
+                    # Fill Deficit (Green) and Overshoot (Gold)
+                    ax_d1.fill_between(t, baseline, d1_sm, where=(mask & (d1_sm < baseline)), color='green', alpha=0.3, interpolate=True)
+                    ax_d1.fill_between(t, baseline, d1_sm, where=(mask & (d1_sm > baseline)), color='gold', alpha=0.3, interpolate=True)
+
+                    # Text Labels (Duration, Area, Lost Time)
+                    center_t = (ev['start_t'] + ev['end_t']) / 2
+                    line1 = f"duration: {ev['duration']:.0f} m"
+                    line2 = f"area: {ev['growth_deficit']:.3f}"
+                    line3 = f"lost: {ev['time_lost']:.1f} m"
+                    label_txt = f"{line1}\n{line2}\n{line3}"
+                    
+                    ax_d1.text(center_t, baseline - 0.001, label_txt, color='black', fontsize=8, ha='center', va='top', fontweight='bold')
+
+                # 3. Acceleration Panel Shading
+                ax_d2.fill_between(t, 0, d2_sm, where=(mask & (d2_sm < 0)), color='red', alpha=0.3, interpolate=True)
+                ax_d2.fill_between(t, 0, d2_sm, where=(mask & (d2_sm > 0)), color='blue', alpha=0.3, interpolate=True)
+
+            # --- Common Formatting ---
+            for ax in axes:
+                # Treatment Shading
+                if treatment_start is not None and treatment_end is not None:
+                    ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.10, zorder=0)
+                    
+                    if ax == ax_len:
+                        treat_center = (treatment_start + treatment_end) / 2
+                        y_min, y_max = ax.get_ylim()
+                        text_y = y_max - (0.05 * (y_max - y_min))
+                        ax.text(treat_center, text_y, "Treatment", color='darkred', ha='center', va='top', fontweight='bold', fontsize=8, alpha=0.8)
+
+                ax.set_xlim(0, x_limit)
+                ax.xaxis.set_major_locator(ticker.MultipleLocator(120))
+                ax.xaxis.set_minor_locator(ticker.MultipleLocator(60))
+                ax.grid(True, which='major', ls='-', alpha=0.4)
+                ax.grid(True, which='minor', ls=':', alpha=0.2)
+
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    print(f"Done. Report saved to {os.path.abspath(filename)}")
+
+def plot_example_survivor_shifted_pub(df, slowdown_params, treatment_start, treatment_end, mother_id=33354, save_name="example_survivor_plot"):
+    """
+    Plots cell length and growth rate for a specific mother_id, 
+    shifting the x-axis to 'Time since treatment start' (-420 to 660).
+    Formatted for publication (7 x 5.25 inches, 8pt fonts, specific z-orders).
+    Saves the result as SVG and high-res PNG.
+    """
+    # 1. Extract and sort trace for the target mother
+    trace = df[df['mother_id'] == mother_id].sort_values('time')
+    if trace.empty:
+        print(f"Error: No data found for mother_id {mother_id}")
+        return
+
+    # Extract raw time and shift it relative to treatment start
+    t_raw = trace['time'].values
+    t_shifted = t_raw - treatment_start
+    
+    # 2. Extract Data
+    y_sm  = trace['log_length_smoothed'].values
+    d1_sm = trace['growth_rate_smoothed'].values
+    
+    d2_col = "second_deriv_smoothed" if "second_deriv_smoothed" in trace.columns else "2nd_deriv_smoothed"
+    d2_sm = trace[d2_col].values
+    
+    divs = trace["division_event"].astype(float).fillna(0).astype(bool).values if "division_event" in trace.columns else np.zeros(len(t_raw), dtype=bool)
+
+    # 3. Detect slowdowns using original (un-shifted) time to maintain baseline accuracy
+    events = _detect_and_measure_slowdowns(t_raw, d1_sm, d2_sm, params=slowdown_params)
+    valid_events = [ev for ev in events if ev.get('is_valid', True)]
+    
+    # Keep ONLY the first slowdown event
+    if len(valid_events) > 0:
+        valid_events = [valid_events[0]]
+
+    # 4. Setup Figure Layout
+    fig, axes = plt.subplots(2, 1, figsize=(7.0, 4))
+    
+    # Apply subplots_adjust parameters
+    fig.subplots_adjust(top=0.95, bottom=0.09, left=0.09, right=0.98, hspace=0.45)
+    
+    ax_len, ax_d1 = axes[0], axes[1]
+    
+    # ==========================================
+    # Panel 1: Log Length
+    # ==========================================
+    ax_len.set_title(r"Cell length trace of an example transiently tolerant survivor treated during exponential growth", fontsize=8)
+    
+    # Plot smoothed line and divisions
+    ax_len.plot(t_shifted, y_sm, c='#d62728', lw=1, label='Smoothed', zorder=2)
+    
+    if divs.any():
+        ax_len.scatter(t_shifted[divs], y_sm[divs], c='cyan', s=10, marker='o', edgecolors='k', linewidths=0.5, zorder=3, label='Division')
+        
+    ax_len.set_ylabel(r"ln[Cell length ($\mu$m)]", fontsize=8)
+    ax_len.set_ylim(0.5, 2.5)
+    ax_len.yaxis.set_major_locator(ticker.MultipleLocator(0.5))
+
+    # ==========================================
+    # Panel 2: Growth Rate
+    # ==========================================
+    ax_d1.set_title(r"Growth rate of the example transiently tolerant survivor", fontsize=8)
+    ax_d1.plot(t_shifted, d1_sm, c='#1f77b4', lw=1, zorder=2)
+    
+    ax_d1.set_ylabel(r"Growth rate (1/l dl/dt)", fontsize=8)
+    ax_d1.set_ylim(0, 0.021)
+    ax_d1.yaxis.set_major_locator(ticker.MultipleLocator(0.005))
+    
+    # 5. Apply Highlights, Baselines, and Shading (Shifted)
+    for ev in valid_events:
+        # Shift event timings
+        ev_start_shift = ev['start_t'] - treatment_start
+        ev_end_shift = ev['end_t'] - treatment_start
+        
+        mask = (t_shifted >= ev_start_shift) & (t_shifted <= ev_end_shift)
+        if not mask.any(): continue
+        
+        # Background Highlight for Slowdown (Transparent Blue)
+        for ax in axes:
+            ax.axvspan(ev_start_shift, ev_end_shift, color='#1f77b4', alpha=0.15, zorder=0, linewidth=0)
+
+        # Rate Panel Annotations
+        baseline = ev['baseline_gr']
+        if np.isfinite(baseline):
+            ax_d1.plot([ev_start_shift, ev_end_shift], [baseline, baseline], color='black', linestyle='--', linewidth=1, zorder=3)
+            
+            # Fill Deficit (Now matching the transparent blue color) and Overshoot (Gold)
+            ax_d1.fill_between(t_shifted, baseline, d1_sm, where=(mask & (d1_sm < baseline)), color='#1f77b4', alpha=0.3, interpolate=True, linewidth=0, zorder=1)
+            ax_d1.fill_between(t_shifted, baseline, d1_sm, where=(mask & (d1_sm > baseline)), color='gold', alpha=0.3, interpolate=True, linewidth=0, zorder=1)
+
+            # Updated Text Labels (Duration to whole minute, Lost Time to whole minute, increased linespacing)
+            center_t = (ev_start_shift + ev_end_shift) / 2
+            label_txt = f"Slowdown duration: {ev['duration']:.0f} minutes\nSlowdown amount: {ev['time_lost']:.0f} minutes"
+            
+            # Moved further down (-0.0015 instead of -0.0005) and brought to front (zorder=10)
+            ax_d1.text(center_t, baseline - 0.0015, label_txt, color='black', ha='center', va='top', 
+                       fontsize=8, linespacing=1.5, zorder=10)
+
+    # ==========================================
+    # Common Formatting & Treatment Shading
+    # ==========================================
+    treat_end_shifted = treatment_end - treatment_start
+    
+    for ax in axes:
+        # Treatment Window
+        if treatment_start is not None and treatment_end is not None:
+            ax.axvspan(0, treat_end_shifted, color='darkred', alpha=0.10, zorder=0, linewidth=0)
+            
+            if ax == ax_len:
+                treat_center = treat_end_shifted / 2
+                y_min, y_max = ax.get_ylim()
+                text_y = y_max - (0.05 * (y_max - y_min))
+                # Brought to front with zorder=10
+                ax.text(treat_center, text_y, r"Antibiotic treatment", color='darkred', ha='center', va='top', 
+                        fontsize=8, zorder=10)
+
+        ax.set_xlim(-420, 660)
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(120))
+        
+        # Apply the x-axis label to both subplots individually
+        ax.set_xlabel(r"Time since treatment start (minutes)", fontsize=8)
+        
+        # Ensure tick labels use 8pt font
+        ax.tick_params(axis='both', labelsize=8)
+
+    # ==========================================
+    # Save Outputs
+    # ==========================================
+    if save_name:
+        # Save as SVG (vector graphic format natively supported by your Nature style preferences)
+        plt.savefig(f"{save_name}.svg", format='svg')
+        # Save as PNG with 300 DPI (high resolution)
+        plt.savefig(f"{save_name}.png", format='png', dpi=300)
+        print(f"Plot successfully saved as '{save_name}.svg' and '{save_name}.png'")
+
+    plt.show()
 
 # =============================================================================
 # Post-Growth Classification (Growing After)
 # =============================================================================
 
-def _check_growing_status(trace, t3, t4, min_divs, max_nan_pct, global_timepoints=None):
+def _check_growing_status(trace, t3, t4, min_divs, max_nan_pct, min_mean_gr, global_timepoints=None):
     """
-    Helper to determine if a cell is 'growing_after' based on data quality
-    and division count in the window [t3, t4].
-    
-    A timepoint is considered 'NaN' (bad) if:
-      1. It is missing (based on global_timepoints in window).
-      2. It exists but has NaN in log_length_cleaned, growth_rate, or second_deriv.
+    Helper to determine if a cell is 'growing_after' based on:
+      1. Division count
+      2. Data quality (NaN %)
+      3. Mean Growth Rate (NEW)
     """
     # 1. Determine Expected Timepoints
     if global_timepoints is None:
@@ -6579,8 +7103,10 @@ def _check_growing_status(trace, t3, t4, min_divs, max_nan_pct, global_timepoint
         expected_times = global_timepoints[mask_exp]
         
     n_expected = len(expected_times)
+    
+    # Defaults if window is empty
     if n_expected == 0:
-        return False, 100.0, 0
+        return False, 100.0, 0, 0.0
         
     # 2. Get Actual Data
     mask = (trace['time'] >= t3) & (trace['time'] <= t4)
@@ -6591,16 +7117,13 @@ def _check_growing_status(trace, t3, t4, min_divs, max_nan_pct, global_timepoint
     n_missing = n_expected - n_present
     
     # 4. Count Explicit NaNs in Present Rows
-    # Length
     c_len = 'log_length_cleaned'
     is_bad = sub[c_len].isna() if c_len in sub.columns else pd.Series(True, index=sub.index)
     
-    # Growth Rate
     c_gr = 'growth_rate'
     if c_gr in sub.columns:
         is_bad = is_bad | sub[c_gr].isna()
         
-    # Second Derivative
     c_d2 = 'second_deriv'
     if c_d2 not in sub.columns:
         if '2nd_deriv' in sub.columns: c_d2 = '2nd_deriv'
@@ -6618,35 +7141,69 @@ def _check_growing_status(trace, t3, t4, min_divs, max_nan_pct, global_timepoint
     div_count = 0
     if 'division_event' in sub.columns:
         div_count = sub['division_event'].fillna(0).astype(bool).sum()
+
+    # 7. Mean Growth Rate (NEW)
+    mean_gr = 0.0
+    if 'growth_rate_smoothed' in sub.columns:
+        gr_vals = sub['growth_rate_smoothed'].dropna()
+        if not gr_vals.empty:
+            mean_gr = float(gr_vals.mean())
         
     # Decision
-    is_growing = (div_count >= min_divs) and (nan_pct <= max_nan_pct)
+    is_growing = (
+        (div_count >= min_divs) and 
+        (nan_pct <= max_nan_pct) and
+        (mean_gr >= min_mean_gr)
+    )
     
-    return is_growing, nan_pct, div_count
+    return is_growing, nan_pct, div_count, mean_gr
 
-def launch_interactive_post_growth_testing(df: pd.DataFrame, t3: float, t4: float, config: dict):
+def launch_interactive_post_growth_testing(
+    df: pd.DataFrame, 
+    t3: float, 
+    t4: float, 
+    config: dict
+) -> Dict[str, Any]:
     """
-    Interactive tool to tune 'growing_after' parameters.
-    Saves T3/T4 into the returned dictionary for batch processing.
+    Napari-based interactive tuning for 'growing_after' classification (T3-T4).
+    Now includes min_mean_growth_rate_window.
     """
+    # 1. Validation & Non-GUI Fallback
+    try:
+        req_min_divs = config["min_divs"]
+        req_max_nan = config["max_nan_pct"]
+        # Handle new key gracefully if older config passed
+        req_min_gr = config.get("min_mean_growth_rate_window", {'min': -5.0, 'max': 5.0, 'step': 0.1, 'default': 0.0})
+    except KeyError as e:
+        raise KeyError(f"Missing required key in GROWTH_AFTER_CONFIG: {e}")
+
     if not _HAS_GUI: 
-        defaults = {k: v['default'] for k, v in config.items()}
-        defaults['t3'] = t3
-        defaults['t4'] = t4
-        return defaults
+        print("Napari not installed/available. Returning defaults from config.")
+        return {
+            'min_divs': req_min_divs['default'],
+            'max_nan_pct': req_max_nan['default'],
+            'min_mean_growth_rate_window': req_min_gr['default'] / 100.0,
+            't3': t3, 't4': t4
+        }
     
+    # 2. Data Setup
     if "at_start" in df.columns:
         candidates = sorted(df[df["at_start"] == True]["mother_id"].unique())
     else:
         candidates = sorted(df["mother_id"].unique())
         
     n_moms = len(candidates)
-    if n_moms == 0: return {}
+    if n_moms == 0: 
+        print("No candidates found.")
+        return {}
     
-    # Global Info
     global_tps = np.sort(df["time"].unique())
     global_max_time = global_tps.max() if len(global_tps) > 0 else 600
+    
+    print(f"Loaded {n_moms} traces.")
+    print(f"Checking Post-Treatment Window: {t3} min -> {t4} min")
 
+    # 3. Viewer Setup
     viewer = napari.Viewer(title="Post-Growth Tester (Growing After)")
     viewer.add_image(np.zeros((n_moms, 1, 1)), name="Navigator", opacity=0.0)
     try:
@@ -6654,60 +7211,120 @@ def launch_interactive_post_growth_testing(df: pd.DataFrame, t3: float, t4: floa
         viewer.window.qt_viewer.dockLayerControls.setVisible(False)
     except: pass
 
+    # 4. Plotter Class
     class PostGrowthPlotter(FigureCanvasQTAgg):
         def __init__(self, width=10, height=6, dpi=100):
             self.fig = Figure(figsize=(width, height), dpi=dpi)
             self.ax = self.fig.add_subplot(111)
-            self.fig.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.15)
+            self.fig.subplots_adjust(left=0.1, right=0.95, top=0.85, bottom=0.15) 
             super().__init__(self.fig)
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        def update_plot(self, mid, t, y, divs, t3, t4, is_growing, nan_pct, div_count, min_divs, max_nan, x_max_limit):
+        def update_plot(self, mid, t, y, divs, t3, t4, is_growing, nan_pct, div_count, mean_gr, 
+                        min_divs, max_nan, min_gr, x_max_limit, growing_before_status):
             self.ax.clear()
+            
+            # Plot Trace
             if y is not None:
                 self.ax.plot(t, y, 'b.-', alpha=0.5, label="Log Length")
                 if divs.any():
                     valid_divs = divs & np.isfinite(y)
-                    self.ax.scatter(t[valid_divs], y[valid_divs], c='cyan', s=30, zorder=3, label="Divisions")
+                    self.ax.scatter(t[valid_divs], y[valid_divs], c='cyan', s=60, zorder=3, edgecolors='k', label="Divisions")
             
-            self.ax.axvspan(t3, t4, color='gray', alpha=0.1, label="Analysis Window")
+            # Highlight Window
+            self.ax.axvspan(t3, t4, color='gray', alpha=0.1, label="Check Window (Post)")
             
-            status_color = "green" if is_growing else "red"
-            status_text = "PASS" if is_growing else "FAIL"
+            # Status Logic
+            status_color = "#2ca02c" if is_growing else "#d62728"
+            status_text = "PASS (Growing)" if is_growing else "FAIL"
             
-            title = (f"Mother {mid}: {status_text} (Growing After)\n"
-                     f"Divisions: {div_count} (Req >= {min_divs}) | "
-                     f"Bad Pts (NaN+Miss): {nan_pct:.1f}% (Req <= {max_nan:.1f}%)")
+            # Growing Before Info
+            if growing_before_status is True:
+                gb_text = "YES"
+            elif growing_before_status is False:
+                gb_text = "NO"
+            else:
+                gb_text = "N/A"
+
+            # Display values (scaled for display)
+            gr_disp = mean_gr * 100.0
+            min_gr_disp = min_gr * 100.0
+
+            # Title Construction (Multi-line)
+            title = (
+                f"Mother {mid}  |  Growing Before: {gb_text}\n"
+                f"Post-Growth Status: {status_text}\n"
+                f"Divisions: {div_count} (Req >= {min_divs}) | "
+                f"Bad Pts: {nan_pct:.1f}% (Req <= {max_nan:.1f}%)\n"
+                f"Mean GR: {gr_disp:.2f} (Req >= {min_gr_disp:.2f}, x10^-2)"
+            )
             
-            self.ax.set_title(title, color=status_color, fontweight='bold')
+            self.ax.set_title(title, color=status_color, fontweight='bold', fontsize=11)
+            
             self.ax.set_xlabel("Time (min)")
             self.ax.set_ylabel("Log Length")
-            self.ax.legend(loc='upper left')
+            self.ax.legend(loc='upper left', frameon=True, fontsize=9)
             
             self.ax.set_xlim(0, x_max_limit)
             self.ax.xaxis.set_major_locator(ticker.MultipleLocator(120))
             self.ax.xaxis.set_minor_locator(ticker.MultipleLocator(60))
             self.ax.grid(True, which='major', ls='-', alpha=0.4)
-            self.ax.grid(True, which='minor', ls=':', alpha=0.2)
             self.draw()
 
     plotter = PostGrowthPlotter()
     viewer.window.add_dock_widget(plotter, area="top", name="Trace View")
 
-    p_divs = config.get('min_divs', {'min': 0, 'max': 10, 'step': 1, 'default': 2})
-    w_divs = IntSlider(min=p_divs['min'], max=p_divs['max'], step=p_divs['step'], 
-                       value=p_divs['default'], label="Min Divisions")
+    # 5. Controls
+    w_divs = IntSlider(
+        min=req_min_divs["min"], 
+        max=req_min_divs["max"], 
+        step=req_min_divs["step"], 
+        value=req_min_divs["default"], 
+        label="Min Divisions"
+    )
     
-    p_nan = config.get('max_nan_pct', {'min': 0, 'max': 100, 'step': 1, 'default': 25})
-    w_nan = FloatSlider(min=p_nan['min'], max=p_nan['max'], step=p_nan['step'], 
-                        value=p_nan['default'], label="Max % Bad (NaN+Miss)")
+    w_nan = FloatSlider(
+        min=req_max_nan["min"], 
+        max=req_max_nan["max"], 
+        step=req_max_nan["step"], 
+        value=req_max_nan["default"], 
+        label="Max % Bad (NaN+Miss)"
+    )
+
+    w_min_gr = FloatSlider(
+        min=req_min_gr["min"],
+        max=req_min_gr["max"],
+        step=req_min_gr["step"],
+        value=req_min_gr["default"],
+        label="Min Mean GR (x10^-2)"
+    )
+    
+    # Fix GUI focus for new slider
+    try:
+        from qtpy.QtCore import Qt
+        from qtpy.QtWidgets import QAbstractSlider, QDoubleSpinBox
+        for s in w_min_gr.native.findChildren(QAbstractSlider): s.setFocusPolicy(Qt.StrongFocus)
+        for s in w_min_gr.native.findChildren(QDoubleSpinBox): s.setDecimals(2)
+    except: pass
     
     w_save = PushButton(text="Finish and Save Parameters")
+    w_save.native.setMinimumHeight(60)
     
-    c_ctrl = Container(widgets=[w_divs, w_nan, Label(value=""), w_save])
+    # Layout: Split into columns
+    c1 = Container(widgets=[w_divs, w_nan], layout="vertical")
+    c2 = Container(widgets=[w_min_gr, Label(value="")], layout="vertical")
+    c_ctrl = Container(widgets=[c1, c2, w_save], layout="vertical")
+    
     viewer.window.add_dock_widget(c_ctrl, area="bottom", name="Parameters")
 
-    final_params = {}
+    # 6. Update Logic
+    final_params = {
+        'min_divs': req_min_divs['default'],
+        'max_nan_pct': req_max_nan['default'],
+        'min_mean_growth_rate_window': req_min_gr['default'] / 100.0,
+        't3': t3, 't4': t4
+    }
+    
     x_max_limit = np.ceil(global_max_time / 120) * 120
 
     def update():
@@ -6719,14 +7336,34 @@ def launch_interactive_post_growth_testing(df: pd.DataFrame, t3: float, t4: floa
             y = trace["log_length_cleaned"].values if "log_length_cleaned" in trace.columns else None
             divs = trace["division_event"].astype(bool).values if "division_event" in trace.columns else np.zeros(len(t), dtype=bool)
             
-            is_growing, nan_pct, div_count = _check_growing_status(
-                trace, t3, t4, w_divs.value, w_nan.value,
+            # Retrieve 'growing_before' status
+            if "growing_before" in df.columns:
+                gb_val = trace["growing_before"].iloc[0]
+                gb_status = bool(gb_val) if pd.notna(gb_val) else False
+            else:
+                gb_status = None
+
+            # Calc Status
+            # IMPORTANT: w_min_gr.value is in x10^-2 units (e.g. 1.0), logic needs raw (0.01)
+            raw_min_gr = w_min_gr.value / 100.0
+
+            is_growing, nan_pct, div_count, mean_gr = _check_growing_status(
+                trace, t3, t4, w_divs.value, w_nan.value, raw_min_gr,
                 global_timepoints=global_tps
             )
-            plotter.update_plot(mid, t, y, divs, t3, t4, is_growing, nan_pct, div_count, w_divs.value, w_nan.value, x_max_limit)
+            
+            plotter.update_plot(
+                mid, t, y, divs, t3, t4, 
+                is_growing, nan_pct, div_count, mean_gr,
+                w_divs.value, w_nan.value, raw_min_gr,
+                x_max_limit, 
+                gb_status
+            )
+            viewer.status = f"Mother {mid} ({int(idx)+1}/{n_moms})"
 
     w_divs.changed.connect(update)
     w_nan.changed.connect(update)
+    w_min_gr.changed.connect(update)
     viewer.dims.events.current_step.connect(lambda e: update())
     
     @w_save.clicked.connect
@@ -6734,25 +7371,29 @@ def launch_interactive_post_growth_testing(df: pd.DataFrame, t3: float, t4: floa
         final_params.update({
             'min_divs': w_divs.value,
             'max_nan_pct': w_nan.value,
+            'min_mean_growth_rate_window': w_min_gr.value / 100.0,
             't3': t3,
             't4': t4
         })
-        print(f"Saved Post-Growth Params: {final_params}")
+        print(f"Growing After Params Saved: {final_params}")
         viewer.close()
 
     viewer.dims.set_current_step(0, 0)
     update()
+    viewer.window.qt_viewer.window().showMaximized()
     napari.run()
     
     return final_params
 
-def _process_post_growth_batch(group, t3, t4, min_divs, max_nan_pct, global_timepoints):
+
+def _process_post_growth_batch(group, t3, t4, min_divs, max_nan_pct, min_mean_gr, global_timepoints):
     """
     Worker function for parallel post-growth classification.
+    Accepts min_mean_gr.
     """
     try:
-        is_growing, nan_pct, div_count = _check_growing_status(
-            group, t3, t4, min_divs, max_nan_pct, 
+        is_growing, nan_pct, div_count, mean_gr = _check_growing_status(
+            group, t3, t4, min_divs, max_nan_pct, min_mean_gr,
             global_timepoints=global_timepoints
         )
         
@@ -6764,9 +7405,11 @@ def _process_post_growth_batch(group, t3, t4, min_divs, max_nan_pct, global_time
     except Exception:
         return None
 
+
 def execute_batch_post_growth_classification(df_main: pd.DataFrame, params: dict) -> pd.DataFrame:
     """
     Applies 'growing_after' classification to the dataset using parallel processing.
+    Includes mean growth rate check.
     """
     if df_main is None: return None
     n_jobs = max(1, multiprocessing.cpu_count() - 1)
@@ -6775,8 +7418,12 @@ def execute_batch_post_growth_classification(df_main: pd.DataFrame, params: dict
     # Extract params
     min_divs = params.get('min_divs', 2)
     max_nan_pct = params.get('max_nan_pct', 25.0)
+    min_mean_gr = params.get('min_mean_growth_rate_window', -100.0) # Default lax if missing
     t3 = params.get('t3', df_main['time'].max() - 360) 
     t4 = params.get('t4', df_main['time'].max())
+    
+    print(f"Window: [{t3:.1f}, {t4:.1f}]")
+    print(f"Criteria: Divs >= {min_divs}, Bad Data <= {max_nan_pct}%, Mean GR >= {min_mean_gr}")
     
     # 1. Establish Global Timepoints
     global_tps = np.sort(df_main["time"].unique())
@@ -6790,14 +7437,14 @@ def execute_batch_post_growth_classification(df_main: pd.DataFrame, params: dict
     else:
         candidates = df_main["mother_id"].unique()
         
-    print(f"Processing {len(candidates)} mother_ids in window [{t3:.1f}, {t4:.1f}]...")
+    print(f"Processing {len(candidates)} mother_ids...")
     
     candidate_mask = df_main["mother_id"].isin(candidates)
     grouped = df_main.loc[candidate_mask].groupby("mother_id")
     
     # Parallel Execution
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_post_growth_batch)(group, t3, t4, min_divs, max_nan_pct, global_tps)
+        delayed(_process_post_growth_batch)(group, t3, t4, min_divs, max_nan_pct, min_mean_gr, global_tps)
         for _, group in tqdm(grouped, desc="Classifying growing_after", total=len(candidates))
     )
     
@@ -6818,261 +7465,749 @@ def execute_batch_post_growth_classification(df_main: pd.DataFrame, params: dict
 
     return df_main
 
-# =============================================================================
-# PDF Reporting (Survivors)
-# =============================================================================
-
-def generate_survivor_pdf(df: pd.DataFrame, 
-                          slowdown_params: dict, 
-                          treatment_start: float,
-                          treatment_end: float,
-                          lanes_to_check: list = None, 
-                          max_IDs_per_lane: int = None,
-                          filename: str = None):
+# Survivors PDF code
+def generate_survivor_pdf(
+    df: pd.DataFrame, 
+    treatment_start: float, 
+    treatment_end: float,
+    lanes_to_check: list = None, 
+    max_IDs_per_lane: int = 50,
+    filename: str = None
+):
     """
-    Generates a multi-page PDF report for 'Survivor' cells.
-    
-    Definition of Survivor: growing_before=True AND growing_after=True.
-    
-    Args:
-        df: Input DataFrame.
-        slowdown_params: Dictionary of parameters used for detecting slowdowns (for visualization).
-        treatment_start: Time (min) treatment started.
-        treatment_end: Time (min) treatment ended.
-        lanes_to_check: List of lane IDs to include.
-        max_IDs_per_lane: Maximum number of mothers to plot per lane. If None, plots all.
-        filename: Output filename.
+    Generates a PDF report for 'Survivors' (growing_before=True AND growing_after=True).
+    Matches the 3-panel layout (Length, Rate, Accel) of the slowdown reports.
     """
     if df is None: return
     
     print(f"{'='*40}\n GENERATING SURVIVOR PDF \n{'='*40}")
-    
-    # 1. Generate Filename if not provided
-    if filename is None:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        current_folder = os.path.basename(os.getcwd())
-        filename = f"survivor_growth_traces_{current_folder}_{timestamp}.pdf"
-    
-    # 2. Filter for Survivors
-    if 'growing_before' not in df.columns: df['growing_before'] = True
-    if 'growing_after' not in df.columns: df['growing_after'] = True
-    
-    mask_survivor = (df['growing_before'] == True) & (df['growing_after'] == True)
-    
-    # Filter by Lane
-    lane_col = None
-    # Try to find a valid lane column
-    for col in ['lane', 'lane_id', 'lane_num', 'position']:
-        if col in df.columns:
-            lane_col = col
-            break
-            
-    if lanes_to_check is not None:
-        if lane_col:
-            # Normalize to strings for comparison
-            valid_lanes = [str(l) for l in lanes_to_check]
-            # Create mask for lanes
-            mask_lane = df[lane_col].astype(str).isin(valid_lanes)
-            mask_survivor = mask_survivor & mask_lane
-            print(f"Filtering by column '{lane_col}': {lanes_to_check}")
-        else:
-            print("Warning: Skipping lane filtering (column not found).")
 
-    # Check for Condition column (for title)
-    cond_col = None
-    if 'condition' in df.columns: cond_col = 'condition'
-    elif 'Condition' in df.columns: cond_col = 'Condition'
+    # 1. Validation
+    req_cols = ['mother_id', 'growing_before', 'growing_after', 'time', 'log_length_smoothed']
+    for c in req_cols:
+        if c not in df.columns:
+            print(f"Error: Required column '{c}' missing from DataFrame.")
+            return
 
-    # --- SAMPLING LOGIC ---
-    # Apply the mask to get the relevant slice of data
-    survivor_df = df[mask_survivor]
+    # 2. Identify Survivors
+    survivor_mask = (df['growing_before'] == True) & (df['growing_after'] == True)
+    survivors = df[survivor_mask]['mother_id'].unique()
     
-    final_survivors = []
-    
-    if max_IDs_per_lane is not None:
-        if lane_col:
-            # Group by lane and sample
-            unique_lanes = survivor_df[lane_col].unique()
-            for lane in unique_lanes:
-                lane_moms = survivor_df[survivor_df[lane_col] == lane]['mother_id'].unique()
-                if len(lane_moms) > max_IDs_per_lane:
-                    selected = random.sample(list(lane_moms), max_IDs_per_lane)
-                    final_survivors.extend(selected)
-                    print(f"  Lane {lane}: Sampled {max_IDs_per_lane}/{len(lane_moms)} survivors.")
-                else:
-                    final_survivors.extend(lane_moms)
-        else:
-            # If no lane column exists, treat whole dataset as one lane
-            all_moms = survivor_df['mother_id'].unique()
-            if len(all_moms) > max_IDs_per_lane:
-                final_survivors = random.sample(list(all_moms), max_IDs_per_lane)
-                print(f"  No lane col: Sampled {max_IDs_per_lane}/{len(all_moms)} survivors.")
-            else:
-                final_survivors = list(all_moms)
-    else:
-        # No limit, take all
-        final_survivors = survivor_df['mother_id'].unique()
-
-    n_survivors = len(final_survivors)
-    
-    if n_survivors == 0:
-        print("No survivors found matching criteria.")
+    if len(survivors) == 0:
+        print("No survivors found.")
         return
 
-    # 3. Setup Global Limits
-    global_tps = df["time"].unique()
-    global_max_time = global_tps.max() if len(global_tps) > 0 else 600
-    x_limit = np.ceil(global_max_time / 120) * 120
-    
-    print(f"Plotting {n_survivors} survivors to '{filename}'...")
+    # 3. Filter by Lane
+    if lanes_to_check is not None:
+        if 'lane' not in df.columns:
+            print("Error: 'lane' column missing, cannot filter by lane.")
+            return
+        print(f"Filtering for lanes: {lanes_to_check}")
+        lane_moms = df[df['lane'].isin(lanes_to_check)]['mother_id'].unique()
+        survivors = np.intersect1d(survivors, lane_moms)
+        
+    if len(survivors) == 0:
+        print(f"No survivors found in the specified lanes.")
+        return
 
-    # 4. Generate PDF
+    print(f"Found {len(survivors)} survivors to plot.")
+
+    # 4. Setup Output
+    if filename is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"survivor_report_{timestamp}.pdf"
+
+    # 5. Selection Logic (Max N per lane)
+    final_list = []
+    if 'lane' in df.columns:
+        meta = df[['mother_id', 'lane']].drop_duplicates().set_index('mother_id')
+        present_lanes = meta.loc[survivors, 'lane'].unique()
+        for lane in sorted(present_lanes):
+            moms_in_lane = sorted(meta[meta['lane'] == lane].index.intersection(survivors))
+            if len(moms_in_lane) > max_IDs_per_lane:
+                final_list.extend(moms_in_lane[:max_IDs_per_lane])
+            else:
+                final_list.extend(moms_in_lane)
+    else:
+        # Fallback if no lane column
+        if len(survivors) > max_IDs_per_lane:
+            final_list = sorted(survivors)[:max_IDs_per_lane]
+        else:
+            final_list = sorted(survivors)
+
+    if not final_list:
+        print("No IDs selected.")
+        return
+
+    # Global X Limit
+    x_max = df['time'].max()
+    x_limit = np.ceil(x_max / 120) * 120
+    
+    print(f"Generating PDF: {filename} ({len(final_list)} plots)...")
+
+    # 6. Plotting Loop
     with PdfPages(filename) as pdf:
-        # Sort for consistent order in PDF
-        for mid in tqdm(sorted(final_survivors), desc="Generating Pages"):
-            
-            # Extract Trace
+        for mid in tqdm(final_list, desc="Plotting Survivors"):
             trace = df[df['mother_id'] == mid].sort_values('time')
             t = trace['time'].values
             
-            # Extract Data
-            y_raw = trace["log_length_cleaned"].values if "log_length_cleaned" in trace.columns else None
-            y_sm = trace["log_length_smoothed"].values if "log_length_smoothed" in trace.columns else None
-            d1_sm = trace["growth_rate_smoothed"].values if "growth_rate_smoothed" in trace.columns else None
+            # Data Extraction
+            y_raw = trace['log_length_cleaned'].values if 'log_length_cleaned' in trace.columns else None
+            y_sm  = trace['log_length_smoothed'].values
+            
+            d1_sm = trace['growth_rate_smoothed'].values if 'growth_rate_smoothed' in trace.columns else None
             
             d2_col = "second_deriv_smoothed" if "second_deriv_smoothed" in trace.columns else "2nd_deriv_smoothed"
             d2_sm = trace[d2_col].values if d2_col in trace.columns else None
             
             divs = trace["division_event"].astype(float).fillna(0).astype(bool).values if "division_event" in trace.columns else np.zeros(len(t), dtype=bool)
 
-            # Re-run detection locally
-            events = []
-            if d1_sm is not None and d2_sm is not None:
-                events = _detect_and_measure_slowdowns(t, d1_sm, d2_sm, params=slowdown_params)
-                events = [ev for ev in events if ev.get('is_valid', True)]
-
-            # --- PLOTTING ---
+            # --- Layout: 3 Vertical Panels ---
             fig, axes = plt.subplots(3, 1, figsize=(8.0, 7.0), sharex=False)
-            plt.subplots_adjust(top=0.95, bottom=0.10, left=0.1, right=0.95, hspace=0.3)
+            plt.subplots_adjust(top=0.92, bottom=0.10, left=0.12, right=0.95, hspace=0.3)
             
             ax_len, ax_d1, ax_d2 = axes[0], axes[1], axes[2]
             
-            # Construct Title
-            title_parts = [f"Mother ID: {mid}"]
-            if lane_col:
-                lid = trace[lane_col].iloc[0]
-                title_parts.append(f"Lane: {lid}")
-            if cond_col:
-                cval = trace[cond_col].iloc[0]
-                title_parts.append(f"{cval}")
+            # Title Construction
+            title_parts = [f"Survivor: Mother {mid}"]
+            if 'lane' in trace.columns:
+                title_parts.append(f"Lane {trace['lane'].iloc[0]}")
+            if 'condition' in trace.columns:
+                title_parts.append(f"{trace['condition'].iloc[0]}")
             
-            title_str = " | ".join(title_parts)
+            fig.suptitle(" | ".join(title_parts), fontweight='bold', fontsize=12)
             
-            # Plot 1: Log Length
-            if y_sm is not None: ax_len.plot(t, y_sm, c='#d62728', lw=2)
+            # --- Panel 1: Log Length ---
+            if y_raw is not None:
+                # Plot raw points faintly behind
+                ax_len.scatter(t, y_raw, c='gray', s=10, alpha=0.3, zorder=1)
+                
+            ax_len.plot(t, y_sm, c='#d62728', lw=2, label='Smoothed', zorder=2)
+            
             if divs.any() and y_raw is not None:
                 valid_divs = divs & np.isfinite(y_raw)
-                ax_len.scatter(t[valid_divs], y_raw[valid_divs], c='cyan', s=30, zorder=3, edgecolors='k')
-            
+                ax_len.scatter(t[valid_divs], y_raw[valid_divs], c='cyan', s=30, marker='o', edgecolors='k', zorder=3, label='Division')
+                
             ax_len.set_ylabel(r"ln[Length ($\mu$m)]", fontweight='bold')
-            ax_len.set_title(title_str, fontweight='bold', fontsize=11)
-            ax_len.set_ylim(0.25, 3.25)  # Updated Limit
+            ax_len.set_ylim(0.25, 3.25) # Standardize limits if appropriate, or remove
 
-            # Plot 2: Growth Rate
+            # --- Panel 2: Growth Rate ---
             if d1_sm is not None:
                 ax_d1.plot(t, d1_sm, c='#1f77b4', lw=2)
-                # Updated Label
                 ax_d1.set_ylabel(r"Growth Rate ($\times 10^{-2} min^{-1}$)", fontweight='bold')
-                
-                # Apply scaling formatter (Display 0.01 as 1.0)
                 ax_d1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
-                
-                # Events
-                for ev in events:
-                    mask = (t >= ev['start_t']) & (t <= ev['end_t'])
-                    if not mask.any(): continue
-                    
-                    baseline = ev['baseline_gr']
-                    if np.isfinite(baseline):
-                        ax_d1.plot([ev['start_t'], ev['end_t']], [baseline, baseline], 'k--', lw=1)
-                        
-                        ax_d1.fill_between(t, baseline, d1_sm, where=(mask & (d1_sm < baseline)), color='green', alpha=0.3, interpolate=True)
-                        ax_d1.fill_between(t, baseline, d1_sm, where=(mask & (d1_sm > baseline)), color='gold', alpha=0.3, interpolate=True)
-                        
-                        label_txt = (f"duration: {ev['duration']:.0f} mins\n"
-                                     f"area: {ev['growth_deficit']:.3f}\n"
-                                     f"lost_time: {ev['time_lost']:.1f} mins")
-                        center_t = (ev['start_t'] + ev['end_t']) / 2
-                        y_pos = baseline - 0.001
-                        ax_d1.text(center_t, y_pos, label_txt, ha='center', va='top', fontsize=7, fontweight='bold')
-            
-            # Fixed Raw Limits (Visuals will show -0.1 to 2.5)
-            ax_d1.set_ylim(-0.001, 0.025)
+                ax_d1.set_ylim(-0.001, 0.025)
 
-            # Plot 3: Acceleration
+            # --- Panel 3: Acceleration ---
             if d2_sm is not None:
                 ax_d2.plot(t, d2_sm, c='#ff7f0e', lw=2)
                 ax_d2.axhline(0, c='k', ls='-', lw=0.8, alpha=0.5)
-                # Updated Label
-                ax_d2.set_ylabel(r"Acceleration ($\times 10^{-4} min^{-2}$)", fontweight='bold')
-                
-                # Apply scaling formatter (Display 0.0001 as 1.0)
+                ax_d2.set_ylabel(r"Accel ($\times 10^{-4} min^{-2}$)", fontweight='bold')
                 ax_d2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*10000:.1f}'))
-                
-                for ev in events:
-                    mask = (t >= ev['start_t']) & (t <= ev['end_t'])
-                    if not mask.any(): continue
-                    ax_d2.fill_between(t, 0, d2_sm, where=(mask & (d2_sm < 0)), color='red', alpha=0.3, interpolate=True)
-                    ax_d2.fill_between(t, 0, d2_sm, where=(mask & (d2_sm > 0)), color='blue', alpha=0.3, interpolate=True)
+                ax_d2.set_ylim(-0.00025, 0.00025)
             
-            # Fixed Raw Limits (Visuals will show -2.5 to 2.5)
-            ax_d2.set_ylim(-0.00025, 0.00025)
+            ax_d2.set_xlabel("Time (min)", fontweight='bold')
 
-            # Common Formatting
+            # --- Common Formatting ---
             for ax in axes:
-                # Highlight Treatment (Dark Red)
-                ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.15, zorder=0)
-                
-                # Treatment Text
-                y_min, y_max = ax.get_ylim()
-                y_range = y_max - y_min
-                text_y = y_max - (0.01 * y_range) # 1% padding
-                
-                treat_center = (treatment_start + treatment_end) / 2
-                ax.text(treat_center, text_y, "Treatment", color='darkred', alpha=1.0, 
-                        ha='center', va='top', fontweight='bold', fontsize=8, zorder=10)
-                
-                # Highlight Slowdown Events (Green)
-                for ev in events:
-                    ax.axvspan(ev['start_t'], ev['end_t'], color='green', alpha=0.1, zorder=0)
-                
-                # Limits & Ticks
+                # Treatment Shading
+                if treatment_start is not None and treatment_end is not None:
+                    ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.15, zorder=0)
+                    
+                    # Label treatment on top graph
+                    if ax == ax_len:
+                        treat_center = (treatment_start + treatment_end) / 2
+                        y_min, y_max = ax.get_ylim()
+                        text_y = y_max - (0.05 * (y_max - y_min))
+                        ax.text(treat_center, text_y, "Treatment", color='darkred', 
+                                ha='center', va='top', fontweight='bold', fontsize=8, alpha=0.8)
+
                 ax.set_xlim(0, x_limit)
                 ax.xaxis.set_major_locator(ticker.MultipleLocator(120))
                 ax.xaxis.set_minor_locator(ticker.MultipleLocator(60))
                 ax.grid(True, which='major', ls='-', alpha=0.4)
                 ax.grid(True, which='minor', ls=':', alpha=0.2)
-                
-                ax.set_xlabel("Time (min)", fontweight='bold')
-                ax.tick_params(labelbottom=True)
 
             pdf.savefig(fig)
             plt.close(fig)
-            
-    print(f"PDF saved to: {os.path.abspath(filename)}")
+
+    print(f"Done. Report saved to {os.path.abspath(filename)}")
+
+def generate_non_survivor_pdf(
+    df: pd.DataFrame, 
+    treatment_start: float, 
+    treatment_end: float,
+    lanes_to_check: list = None, 
+    max_IDs_per_lane: int = 50,
+    filename: str = None
+):
+    """
+    Generates a PDF report for 'Non-Survivors' (growing_before=True AND growing_after=False).
+    Matches the 3-panel layout (Length, Rate, Accel) of the slowdown reports.
+    """
+    if df is None: return
     
+    print(f"{'='*40}\n GENERATING NON-SURVIVOR PDF \n{'='*40}")
+
+    # 1. Validation
+    req_cols = ['mother_id', 'growing_before', 'growing_after', 'time', 'log_length_smoothed']
+    for c in req_cols:
+        if c not in df.columns:
+            print(f"Error: Required column '{c}' missing from DataFrame.")
+            return
+
+    # 2. Identify Non-Survivors
+    non_survivor_mask = (df['growing_before'] == True) & (df['growing_after'] == False)
+    non_survivors = df[non_survivor_mask]['mother_id'].unique()
+    
+    if len(non_survivors) == 0:
+        print("No non-survivors found.")
+        return
+
+    # 3. Filter by Lane
+    if lanes_to_check is not None:
+        if 'lane' not in df.columns:
+            print("Error: 'lane' column missing, cannot filter by lane.")
+            return
+        print(f"Filtering for lanes: {lanes_to_check}")
+        lane_moms = df[df['lane'].isin(lanes_to_check)]['mother_id'].unique()
+        non_survivors = np.intersect1d(non_survivors, lane_moms)
+        
+    if len(non_survivors) == 0:
+        print(f"No non-survivors found in the specified lanes.")
+        return
+
+    print(f"Found {len(non_survivors)} non-survivors to plot.")
+
+    # 4. Setup Output
+    if filename is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"non_survivor_report_{timestamp}.pdf"
+
+    # 5. Selection Logic (Max N per lane)
+    final_list = []
+    if 'lane' in df.columns:
+        meta = df[['mother_id', 'lane']].drop_duplicates().set_index('mother_id')
+        present_lanes = meta.loc[non_survivors, 'lane'].unique()
+        for lane in sorted(present_lanes):
+            moms_in_lane = sorted(meta[meta['lane'] == lane].index.intersection(non_survivors))
+            if len(moms_in_lane) > max_IDs_per_lane:
+                final_list.extend(moms_in_lane[:max_IDs_per_lane])
+            else:
+                final_list.extend(moms_in_lane)
+    else:
+        # Fallback if no lane column
+        if len(non_survivors) > max_IDs_per_lane:
+            final_list = sorted(non_survivors)[:max_IDs_per_lane]
+        else:
+            final_list = sorted(non_survivors)
+
+    if not final_list:
+        print("No IDs selected.")
+        return
+
+    # Global X Limit
+    x_max = df['time'].max()
+    x_limit = np.ceil(x_max / 120) * 120
+    
+    print(f"Generating PDF: {filename} ({len(final_list)} plots)...")
+
+    # 6. Plotting Loop
+    with PdfPages(filename) as pdf:
+        for mid in tqdm(final_list, desc="Plotting Non-Survivors"):
+            trace = df[df['mother_id'] == mid].sort_values('time')
+            t = trace['time'].values
+            
+            # Data Extraction
+            y_raw = trace['log_length_cleaned'].values if 'log_length_cleaned' in trace.columns else None
+            y_sm  = trace['log_length_smoothed'].values
+            
+            d1_sm = trace['growth_rate_smoothed'].values if 'growth_rate_smoothed' in trace.columns else None
+            
+            d2_col = "second_deriv_smoothed" if "second_deriv_smoothed" in trace.columns else "2nd_deriv_smoothed"
+            d2_sm = trace[d2_col].values if d2_col in trace.columns else None
+            
+            divs = trace["division_event"].astype(float).fillna(0).astype(bool).values if "division_event" in trace.columns else np.zeros(len(t), dtype=bool)
+
+            # --- Layout: 3 Vertical Panels ---
+            fig, axes = plt.subplots(3, 1, figsize=(8.0, 7.0), sharex=False)
+            plt.subplots_adjust(top=0.92, bottom=0.10, left=0.12, right=0.95, hspace=0.3)
+            
+            ax_len, ax_d1, ax_d2 = axes[0], axes[1], axes[2]
+            
+            # Title Construction
+            title_parts = [f"Non-Survivor: Mother {mid}"]
+            if 'lane' in trace.columns:
+                title_parts.append(f"Lane {trace['lane'].iloc[0]}")
+            if 'condition' in trace.columns:
+                title_parts.append(f"{trace['condition'].iloc[0]}")
+            
+            fig.suptitle(" | ".join(title_parts), fontweight='bold', fontsize=12)
+            
+            # --- Panel 1: Log Length ---
+            if y_raw is not None:
+                # Plot raw points faintly behind
+                ax_len.scatter(t, y_raw, c='gray', s=10, alpha=0.3, zorder=1)
+                
+            ax_len.plot(t, y_sm, c='#d62728', lw=2, label='Smoothed', zorder=2)
+            
+            if divs.any() and y_raw is not None:
+                valid_divs = divs & np.isfinite(y_raw)
+                ax_len.scatter(t[valid_divs], y_raw[valid_divs], c='cyan', s=30, marker='o', edgecolors='k', zorder=3, label='Division')
+                
+            ax_len.set_ylabel(r"ln[Length ($\mu$m)]", fontweight='bold')
+            ax_len.set_ylim(0.25, 3.25) # Standardize limits if appropriate, or remove
+
+            # --- Panel 2: Growth Rate ---
+            if d1_sm is not None:
+                ax_d1.plot(t, d1_sm, c='#1f77b4', lw=2)
+                ax_d1.set_ylabel(r"Growth Rate ($\times 10^{-2} min^{-1}$)", fontweight='bold')
+                ax_d1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
+                ax_d1.set_ylim(-0.001, 0.025)
+
+            # --- Panel 3: Acceleration ---
+            if d2_sm is not None:
+                ax_d2.plot(t, d2_sm, c='#ff7f0e', lw=2)
+                ax_d2.axhline(0, c='k', ls='-', lw=0.8, alpha=0.5)
+                ax_d2.set_ylabel(r"Accel ($\times 10^{-4} min^{-2}$)", fontweight='bold')
+                ax_d2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*10000:.1f}'))
+                ax_d2.set_ylim(-0.00025, 0.00025)
+            
+            ax_d2.set_xlabel("Time (min)", fontweight='bold')
+
+            # --- Common Formatting ---
+            for ax in axes:
+                # Treatment Shading
+                if treatment_start is not None and treatment_end is not None:
+                    ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.15, zorder=0)
+                    
+                    # Label treatment on top graph
+                    if ax == ax_len:
+                        treat_center = (treatment_start + treatment_end) / 2
+                        y_min, y_max = ax.get_ylim()
+                        text_y = y_max - (0.05 * (y_max - y_min))
+                        ax.text(treat_center, text_y, "Treatment", color='darkred', 
+                                ha='center', va='top', fontweight='bold', fontsize=8, alpha=0.8)
+
+                ax.set_xlim(0, x_limit)
+                ax.xaxis.set_major_locator(ticker.MultipleLocator(120))
+                ax.xaxis.set_minor_locator(ticker.MultipleLocator(60))
+                ax.grid(True, which='major', ls='-', alpha=0.4)
+                ax.grid(True, which='minor', ls=':', alpha=0.2)
+
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    print(f"Done. Report saved to {os.path.abspath(filename)}")
+
+
+# Lag time calculation code
+def analyze_global_growth_thresholds(df: pd.DataFrame, 
+                                     percentages: list = [5, 10, 15, 20], 
+                                     n_plot: int = 50, 
+                                     treatment_start: float = None, 
+                                     treatment_end: float = None,
+                                     filename: str = None,
+                                     require_growing_before: bool = True,
+                                     require_growing_after: bool = False,
+                                     start_time: float = 0.0):
+    """
+    Calculates global growth rate percentiles (top X%) and plots them 
+    on random traces for visual inspection.
+
+    Args:
+        df: DataFrame containing 'growth_rate_smoothed'.
+        percentages: List of 'top X%' values to test (e.g., [5, 10] means 95th and 90th percentiles).
+        n_plot: Number of example mothers to plot PER LANE (ordered by mother_id).
+        treatment_start: Start of treatment (min) for shading.
+        treatment_end: End of treatment (min) for shading.
+        filename: Output filename.
+        require_growing_before: If True, only use mothers with growing_before == True for threshold calc.
+        require_growing_after: If True, only use mothers with growing_after == True for threshold calc.
+        start_time: Time (min) to start collecting data for the global max growth rate calculation.
+    """
+    if df is None: return
+    if 'growth_rate_smoothed' not in df.columns:
+        print("Error: 'growth_rate_smoothed' column not found.")
+        return
+
+    print(f"{'='*40}\n ANALYZING GLOBAL GROWTH THRESHOLDS \n{'='*40}")
+
+    # --- 1. Filter Population for Threshold Calculation ---
+    eligible_df = df.copy()
+    if require_growing_before and 'growing_before' in eligible_df.columns:
+        eligible_df = eligible_df[eligible_df['growing_before'] == True]
+    if require_growing_after and 'growing_after' in eligible_df.columns:
+        eligible_df = eligible_df[eligible_df['growing_after'] == True]
+
+    valid_mids = eligible_df['mother_id'].unique()
+    
+    if len(valid_mids) == 0:
+        print("Error: No mothers found matching the growth criteria.")
+        return
+
+    # Apply start_time filter for the calculation
+    df_calc = eligible_df[eligible_df['time'] >= start_time]
+
+    # Calculate Global Percentiles
+    all_rates = df_calc['growth_rate_smoothed'].dropna().values
+    
+    if len(all_rates) == 0:
+        print(f"Error: No valid growth rates found after {start_time} min.")
+        return
+    
+    thresholds = {}
+    print(f"Calculated Global Thresholds (Top X%) using eligible mothers after {start_time} min:")
+    for p in percentages:
+        # Top 5% = 95th percentile
+        perc_val = 100 - p
+        thresh = np.percentile(all_rates, perc_val)
+        thresholds[f"Top {p}%"] = thresh
+        print(f"  Top {p}% (>{perc_val}th perc): {thresh:.5f} [min^-1] ({thresh*100:.2f} x10^-2)")
+
+    # --- 2. Select Random Mothers (Sampling PER LANE from eligible pool) ---
+    selected_moms = []
+    if n_plot > 0:
+        lane_col = next((c for c in ['lane', 'lane_id', 'lane_num', 'position'] if c in df.columns), None)
+        
+        if lane_col:
+            for lane, group in eligible_df.groupby(lane_col):
+                lane_moms = sorted(group['mother_id'].unique())
+                if len(lane_moms) > n_plot:
+                    selected_moms.extend(sorted(random.sample(lane_moms, n_plot)))
+                else:
+                    selected_moms.extend(lane_moms)
+        else:
+            # Fallback if no lane column is found
+            all_moms = sorted(valid_mids)
+            if len(all_moms) > n_plot:
+                selected_moms = sorted(random.sample(all_moms, n_plot))
+            else:
+                selected_moms = all_moms
+        
+    # --- 3. Setup PDF ---
+    if filename is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"growth_threshold_test_{timestamp}.pdf"
+        
+    # Colormap for thresholds
+    colors = plt.cm.viridis(np.linspace(0, 0.8, len(percentages)))
+    
+    global_max_time = df["time"].max() if "time" in df.columns else 600
+    x_limit = np.ceil(global_max_time / 120) * 120
+
+    print(f"\nGenerating PDF report for {len(selected_moms)} total traces: {filename}...")
+    
+    with PdfPages(filename) as pdf:
+        for mid in tqdm(selected_moms, desc="Plotting"):
+            
+            trace = df[df['mother_id'] == mid].sort_values('time')
+            t = trace['time'].values
+            
+            # Data
+            y_sm = trace["log_length_smoothed"].values if "log_length_smoothed" in trace.columns else None
+            d1_sm = trace["growth_rate_smoothed"].values if "growth_rate_smoothed" in trace.columns else None
+            
+            d2_col = "second_deriv_smoothed" if "second_deriv_smoothed" in trace.columns else "2nd_deriv_smoothed"
+            d2_sm = trace[d2_col].values if d2_col in trace.columns else None
+
+            # Setup Plot
+            fig, axes = plt.subplots(3, 1, figsize=(8.0, 7.0), sharex=False)
+            plt.subplots_adjust(top=0.92, bottom=0.10, left=0.1, right=0.95, hspace=0.3)
+            ax_len, ax_d1, ax_d2 = axes[0], axes[1], axes[2]
+            
+            # Title
+            lane_info = f"Lane: {trace['lane'].iloc[0]}" if 'lane' in trace.columns else ""
+            fig.suptitle(f"Mother ID: {mid} | {lane_info}", fontweight='bold')
+            
+            # Plot 1: Length
+            if y_sm is not None: 
+                ax_len.plot(t, y_sm, c='#d62728', lw=2)
+            ax_len.set_ylabel("ln(Length)")
+            
+            # Plot 2: Growth Rate (WITH THRESHOLDS)
+            if d1_sm is not None:
+                ax_d1.plot(t, d1_sm, c='#1f77b4', lw=2, label='Rate')
+                
+                # Add Threshold Lines
+                for i, (label, val) in enumerate(thresholds.items()):
+                    ax_d1.axhline(val, color=colors[i], linestyle='--', alpha=0.8, lw=1.5, 
+                                  label=f"{label}: {val*100:.1f}")
+                
+                ax_d1.set_ylabel(r"Growth Rate ($\times 10^{-2}$)")
+                ax_d1.legend(loc='upper right', fontsize=8, framealpha=0.9)
+                ax_d1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
+
+            # Plot 3: Acceleration
+            if d2_sm is not None:
+                ax_d2.plot(t, d2_sm, c='#ff7f0e', lw=2)
+                ax_d2.axhline(0, c='k', ls='-', lw=0.5)
+                ax_d2.set_ylabel(r"Accel ($\times 10^{-4}$)")
+                ax_d2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*10000:.1f}'))
+
+            # Common Formatting
+            for ax in axes:
+                if treatment_start is not None and treatment_end is not None:
+                    ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1)
+                
+                ax.set_xlim(0, x_limit)
+                ax.grid(True, ls=':', alpha=0.4)
+                
+            ax_d2.set_xlabel("Time (min)")
+
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    print(f"PDF saved to: {os.path.abspath(filename)}")
+    return thresholds
+
+def calculate_accumulated_lag(df: pd.DataFrame, 
+                              top_percentile: float = 10.0, 
+                              allow_recovery: bool = True,
+                              n_plot: int = 50,
+                              treatment_start: float = None, 
+                              treatment_end: float = None,
+                              filename: str = None,
+                              accumulation_start_time: float = 0.0,
+                              require_growing_before: bool = True,
+                              require_growing_after: bool = False,
+                              start_time: float = 0.0):
+    """
+    Calculates 'Accumulated Lag' based on the area between the global max growth rate 
+    and the actual growth rate curve.
+
+    Args:
+        top_percentile: Defines Global Max GR (e.g., 10.0 = Top 10% / 90th percentile).
+        allow_recovery: If True, rates > Global Max subtract from accumulated lag.
+                        If False, rates > Global Max are treated as 0 deficit.
+        n_plot: Number of example mothers to plot PER LANE (ordered by mother_id).
+        treatment_start: Used for plot shading.
+        treatment_end: Used for plot shading.
+        accumulation_start_time: Time (min) to begin accumulating lag. Deficits before 
+                                 this time are ignored (set to 0).
+        require_growing_before: If True, only use mothers with growing_before == True for global max rate.
+        require_growing_after: If True, only use mothers with growing_after == True for global max rate.
+        start_time: Time (min) to start collecting data for the global max growth rate calculation.
+    
+    Adds columns: 'accum_lag_current', 'accum_lag_total'.
+    """
+    if df is None: return None
+    if 'growth_rate_smoothed' not in df.columns:
+        print("Error: 'growth_rate_smoothed' column not found.")
+        return None
+
+    print(f"{'='*40}\n CALCULATING ACCUMULATED LAG \n{'='*40}")
+
+    # --- 1. Filter Population for Global Max Rate Calculation ---
+    eligible_df = df.copy()
+    if require_growing_before and 'growing_before' in eligible_df.columns:
+        eligible_df = eligible_df[eligible_df['growing_before'] == True]
+    if require_growing_after and 'growing_after' in eligible_df.columns:
+        eligible_df = eligible_df[eligible_df['growing_after'] == True]
+
+    valid_mids = eligible_df['mother_id'].unique()
+    if len(valid_mids) == 0:
+        print("Error: No mothers found matching the growth criteria.")
+        return df
+
+    # Apply start_time filter for the calculation window
+    df_calc = eligible_df[eligible_df['time'] >= start_time]
+
+    # Calculate Global Max Growth Rate
+    all_rates = df_calc['growth_rate_smoothed'].dropna().values
+    if len(all_rates) == 0:
+        print(f"Error: No valid growth rates found after {start_time} min for threshold calculation.")
+        return df
+
+    perc_threshold = 100 - top_percentile
+    global_max_gr = np.percentile(all_rates, perc_threshold)
+    
+    print(f"Global Max Growth Rate (Top {top_percentile}% after {start_time}m): {global_max_gr:.6f} min^-1")
+    print(f"Lag Recovery (subtract when rate > max): {allow_recovery}")
+    print(f"Accumulation Start Time: {accumulation_start_time} min")
+
+    # --- 2. Process Each Mother (calculates for full DataFrame) ---
+    def _calc_lag_for_group(group):
+        group = group.sort_values('time')
+        t = group['time'].values
+        gr = group['growth_rate_smoothed'].values
+        
+        # Handle NaNs: fill with global_max_gr so they contribute 0 deviation
+        gr_filled = np.nan_to_num(gr, nan=global_max_gr)
+        
+        # Calculate Deficit
+        if allow_recovery:
+            # Recovery Mode: Simple difference. 
+            # If GR > Max, deficit is negative (reduces lag).
+            deficit = global_max_gr - gr_filled
+        else:
+            # Strict Mode: Only accumulate positive lag. 
+            # If GR > Max, deficit is 0.
+            deficit = np.maximum(0, global_max_gr - gr_filled)
+        
+        # Zero out deficit before accumulation start time
+        if accumulation_start_time is not None:
+            deficit[t < accumulation_start_time] = 0.0
+
+        # Integrate Deficit over Time
+        if len(t) > 1:
+            cum_area = cumulative_trapezoid(deficit, t, initial=0)
+        else:
+            cum_area = np.zeros_like(deficit)
+            
+        # Calculate Lag (Minutes)
+        cum_lag = cum_area / global_max_gr
+        
+        return pd.DataFrame({
+            'accum_lag_current': cum_lag,
+            'accum_lag_total': cum_lag[-1]
+        }, index=group.index)
+
+    print("Computing lag for all mothers...")
+    lag_cols = df.groupby('mother_id', group_keys=False).apply(_calc_lag_for_group)
+    
+    # Assign back
+    df['accum_lag_current'] = lag_cols['accum_lag_current']
+    df['accum_lag_total'] = lag_cols['accum_lag_total']
+    
+    # --- 3. Visualization ---
+    if filename is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        rec_str = "with_recovery" if allow_recovery else "no_recovery"
+        filename = f"accumulated_lag_{rec_str}_top{int(top_percentile)}pct_start{int(accumulation_start_time)}_{timestamp}.pdf"
+
+    # Select and Sort mothers (Sampling PER LANE from eligible mothers)
+    selected_moms = []
+    if n_plot > 0:
+        lane_col = next((c for c in ['lane', 'lane_id', 'lane_num', 'position'] if c in df.columns), None)
+        
+        if lane_col:
+            for lane, group in eligible_df.groupby(lane_col):
+                lane_moms = sorted(group['mother_id'].unique())
+                if len(lane_moms) > n_plot:
+                    selected_moms.extend(sorted(random.sample(lane_moms, n_plot)))
+                else:
+                    selected_moms.extend(lane_moms)
+        else:
+            all_moms = sorted(valid_mids)
+            if len(all_moms) > n_plot:
+                selected_moms = sorted(random.sample(all_moms, n_plot))
+            else:
+                selected_moms = all_moms
+        
+    global_max_time = df["time"].max() if "time" in df.columns else 600
+    x_limit = np.ceil(global_max_time / 120) * 120
+
+    if selected_moms:
+        print(f"Generating PDF report for {len(selected_moms)} total traces: {filename}")
+        
+        with PdfPages(filename) as pdf:
+            for mid in tqdm(selected_moms, desc="Plotting Lag"):
+                
+                trace = df[df['mother_id'] == mid].sort_values('time')
+                t = trace['time'].values
+                
+                y_sm = trace["log_length_smoothed"].values if "log_length_smoothed" in trace.columns else None
+                gr = trace["growth_rate_smoothed"].values if "growth_rate_smoothed" in trace.columns else None
+                
+                d2_col = "second_deriv_smoothed" if "second_deriv_smoothed" in trace.columns else "2nd_deriv_smoothed"
+                d2_sm = trace[d2_col].values if d2_col in trace.columns else None
+                
+                lag_total = trace['accum_lag_total'].iloc[0] if 'accum_lag_total' in trace.columns else 0.0
+    
+                # Setup 3-Panel Plot
+                fig, axes = plt.subplots(3, 1, figsize=(8.0, 7.0), sharex=False)
+                plt.subplots_adjust(top=0.92, bottom=0.10, left=0.1, right=0.95, hspace=0.3)
+                ax_len, ax_d1, ax_d2 = axes[0], axes[1], axes[2]
+                
+                # Title
+                lane_info = f"Lane: {trace['lane'].iloc[0]}" if 'lane' in trace.columns else ""
+                fig.suptitle(f"Mother ID: {mid} | {lane_info} | Accum Lag: {lag_total:.1f} mins", fontweight='bold')
+                
+                # Panel 1: Length
+                if y_sm is not None: 
+                    ax_len.plot(t, y_sm, c='#d62728', lw=2)
+                ax_len.set_ylabel("ln(Length)")
+                ax_len.grid(True, ls=':', alpha=0.4)
+                
+                # Panel 2: Growth Rate
+                if gr is not None:
+                    ax_d1.plot(t, gr, c='#1f77b4', lw=2, label='Growth Rate')
+                    ax_d1.axhline(global_max_gr, color='black', linestyle='--', lw=1.5, label=f'Global Max ({global_max_gr*100:.2f})')
+                    
+                    gr_filled = np.nan_to_num(gr, nan=global_max_gr)
+                    
+                    # Create mask for "After Start Time" shading
+                    mask_active = (t >= accumulation_start_time)
+    
+                    # Shade Lag (Red) - Only after accumulation starts
+                    ax_d1.fill_between(t, global_max_gr, gr_filled, 
+                                       where=(mask_active & (gr_filled < global_max_gr)), 
+                                       color='red', alpha=0.3, interpolate=True, 
+                                       label='Lag (+)')
+                    
+                    # Shade Recovery (Green) - Only after accumulation starts, if enabled
+                    if allow_recovery:
+                        ax_d1.fill_between(t, global_max_gr, gr_filled,
+                                           where=(mask_active & (gr_filled > global_max_gr)),
+                                           color='green', alpha=0.3, interpolate=True,
+                                           label='Recovery (-)')
+                    
+                    # Visual Indicator for Start Time
+                    if accumulation_start_time > 0:
+                        ax_d1.axvline(accumulation_start_time, color='gray', linestyle=':', lw=2, label="Accum Start")
+    
+                    ax_d1.set_ylabel(r"Growth Rate ($\times 10^{-2}$)")
+                    ax_d1.legend(loc='upper right', fontsize=8, framealpha=0.9)
+                    ax_d1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
+                    
+                    # Limits
+                    valid_gr = gr[np.isfinite(gr)]
+                    y_max_data = np.max(valid_gr) if len(valid_gr) > 0 else 0.03
+                    upper_lim = max(y_max_data, global_max_gr) * 1.2
+                    if not np.isfinite(upper_lim): upper_lim = 0.05
+                    ax_d1.set_ylim(-0.005, upper_lim)
+                    ax_d1.grid(True, ls=':', alpha=0.4)
+    
+                # Panel 3: Acceleration
+                if d2_sm is not None:
+                    ax_d2.plot(t, d2_sm, c='#ff7f0e', lw=2)
+                    ax_d2.axhline(0, c='k', ls='-', lw=0.5)
+                    ax_d2.set_ylabel(r"Accel ($\times 10^{-4}$)")
+                    ax_d2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*10000:.1f}'))
+                    ax_d2.grid(True, ls=':', alpha=0.4)
+                    
+                ax_d2.set_xlabel("Time (min)")
+    
+                # Common Formatting
+                for ax in axes:
+                    if treatment_start is not None and treatment_end is not None:
+                        ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1)
+                    ax.set_xlim(0, x_limit)
+    
+                pdf.savefig(fig)
+                plt.close(fig)
+    
+        print(f"Done. Columns 'accum_lag_current'/'accum_lag_total' added. PDF saved to {os.path.abspath(filename)}")
+    else:
+        print("Done. Columns 'accum_lag_current'/'accum_lag_total' added. (No plots generated).")
+
+    return df
+
+
 # temp data analysis functions
 def plot_slowdown_survivor_growth_rates(df: pd.DataFrame, 
                                         check_time: float = 120.0, 
                                         treatment_start: float = None, 
-                                        treatment_end: float = None):
+                                        treatment_end: float = None,
+                                        require_growing_before: bool = True,
+                                        require_growing_after: bool = True,
+                                        mode_round_interval: float = 0.0005):
     """
-    Plots growth_rate_smoothed vs time for 'Slowdown Survivors' per lane,
-    plus a final summary plot comparing means across all lanes.
+    Plots Mean, Median, and Mode of growth_rate_smoothed vs time for cells 
+    that exhibit a slowdown at 'check_time'.
     
-    A 'Slowdown Survivor' is defined as:
-      1. growing_after == True
-      2. Has an active slowdown event at 'check_time' (default 120 min).
+    Layout: 2 Columns of plots for individual conditions.
     """
     if df is None:
         print("Error: DataFrame is None.")
@@ -7088,80 +8223,97 @@ def plot_slowdown_survivor_growth_rates(df: pd.DataFrame,
         print("Error: Could not find a 'lane' column.")
         return
     
-    # 2. Filter for General Survivors (growing_after == True)
-    if 'growing_after' not in df.columns:
-        print("Warning: 'growing_after' column not found. Using all cells as base population.")
-        all_survivors = df
-    else:
-        all_survivors = df[df['growing_after'] == True]
+    # 2. Filter Base Population
+    candidates = df.copy()
+    if require_growing_before and 'growing_before' in candidates.columns:
+        candidates = candidates[candidates['growing_before'] == True]
+    if require_growing_after and 'growing_after' in candidates.columns:
+        candidates = candidates[candidates['growing_after'] == True]
 
-    # 3. Filter for Specific "Slowdown Survivors" (Slowdown active at check_time)
-    # Look for rows near check_time where slowdown is True
-    target_rows = all_survivors[
-        (all_survivors['time'] >= check_time - 2.0) & 
-        (all_survivors['time'] <= check_time + 2.0) &
-        (all_survivors['slowdown'] == True)
+    if candidates.empty:
+        print("No cells matched the growth criteria.")
+        return
+
+    # 3. Filter for Slowdown Survivors
+    target_rows = candidates[
+        (candidates['time'] >= check_time - 2.0) & 
+        (candidates['time'] <= check_time + 2.0) &
+        (candidates['slowdown'] == True)
     ]
     
     slowdown_mids = target_rows['mother_id'].unique()
-    
     if len(slowdown_mids) == 0:
         print(f"No mothers found with an active slowdown at t={check_time}.")
         return
 
-    print(f"Found {len(slowdown_mids)} Slowdown Survivors out of {all_survivors['mother_id'].nunique()} Total Survivors.")
+    print(f"Found {len(slowdown_mids)} Slowdown Cells out of {candidates['mother_id'].nunique()} Base Candidates.")
     
     # 4. Extract Traces
-    # We need the full traces for the slowdown mothers to plot
     slowdown_df = df[df['mother_id'].isin(slowdown_mids)].copy()
     
     # 5. Grouping
     if cond_col:
-        # Create a unique key for grouping to ensure consistent ordering
         groups = slowdown_df[[lane_col, cond_col]].drop_duplicates().sort_values(lane_col)
     else:
         groups = slowdown_df[[lane_col]].drop_duplicates().sort_values(lane_col)
         groups['condition'] = "Unknown"
 
-    sns.set_theme(style="ticks", context="talk")
+    # Helper for mode
+    def calculate_custom_mode(series):
+        rounded = (series / mode_round_interval).round() * mode_round_interval
+        m = rounded.mode()
+        return m.iloc[0] if not m.empty else np.nan
+
+    # --- SETUP SUBPLOTS ---
+    n_groups = len(groups)
+    n_cols = 2
+    n_rows = math.ceil(n_groups / n_cols)
     
-    # Store means for the final summary plot
-    # List of dicts: {'label': str, 'data': pd.DataFrame (time, growth_rate)}
+    # Create the figure for the grid
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows), constrained_layout=True)
+    axes = np.array(axes).flatten() # Flatten to 1D array for easy indexing
+
+    sns.set_theme(style="ticks", context="talk")
     summary_data = []
 
-    # 6. Generate Individual Plots
-    for _, row in groups.iterrows():
+    # 6. Iterate and Plot
+    for i, (_, row) in enumerate(groups.iterrows()):
+        ax = axes[i]
         lane_val = row[lane_col]
         cond_val = row[cond_col] if cond_col else "Unknown"
         
-        # A. Filter Data for this Group
-        # 1. Total Survivors (Denominator)
+        # Filter Data
         if cond_col:
-            group_total = all_survivors[(all_survivors[lane_col] == lane_val) & (all_survivors[cond_col] == cond_val)]
+            group_total = candidates[(candidates[lane_col] == lane_val) & (candidates[cond_col] == cond_val)]
             group_slow = slowdown_df[(slowdown_df[lane_col] == lane_val) & (slowdown_df[cond_col] == cond_val)]
         else:
-            group_total = all_survivors[all_survivors[lane_col] == lane_val]
+            group_total = candidates[candidates[lane_col] == lane_val]
             group_slow = slowdown_df[slowdown_df[lane_col] == lane_val]
             
-        if group_slow.empty: continue
+        if group_slow.empty: 
+            ax.text(0.5, 0.5, "No Data", ha='center', va='center')
+            continue
         
-        # B. Calculate Stats
+        # Stats
         n_total = group_total['mother_id'].nunique()
         n_slow = group_slow['mother_id'].nunique()
         pct = (n_slow / n_total * 100.0) if n_total > 0 else 0.0
         
-        # C. Calculate Mean Trace for Summary
-        # We group by time and take the mean of growth_rate_smoothed
-        mean_trace = group_slow.groupby('time')['growth_rate_smoothed'].mean().reset_index()
+        # Calculate Aggregates
+        grouped_time = group_slow.groupby('time')['growth_rate_smoothed']
+        mean_trace = grouped_time.mean()
+        median_trace = grouped_time.median()
+        mode_trace = grouped_time.apply(calculate_custom_mode)
+
         summary_data.append({
             'label': f"Lane {lane_val}: {cond_val}",
             'n_str': f"(n={n_slow})",
-            'data': mean_trace
+            'mean': mean_trace,
+            'median': median_trace,
+            'mode': mode_trace
         })
 
-        # D. Plotting
-        plt.figure(figsize=(10, 6))
-        
+        # --- Plot on Subplot (ax) ---
         # Individual Traces
         sns.lineplot(
             data=group_slow,
@@ -7171,109 +8323,130 @@ def plot_slowdown_survivor_growth_rates(df: pd.DataFrame,
             estimator=None,
             color="gray",
             alpha=0.3,
-            lw=1
+            lw=1,
+            ax=ax
         )
         
-        # Mean Trace
-        sns.lineplot(
-            data=group_slow,
-            x="time",
-            y="growth_rate_smoothed",
-            color="#1f77b4",
-            lw=3,
-            label="Mean Growth Rate"
-        )
+        # Mean Trace Overlay
+        ax.plot(mean_trace.index, mean_trace.values, color="#1f77b4", lw=3, label="Mean Growth Rate")
         
         # Shading
         if treatment_start is not None and treatment_end is not None:
-            plt.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1)
-            # Add text only if y-limits allow, or place manually
+            ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1)
         
-        plt.axvline(check_time, color='green', linestyle='--', alpha=0.8)
+        ax.axvline(check_time, color='green', linestyle='--', alpha=0.8)
 
-        # Title with Stats
-        title_str = f"Lane {lane_val}: {cond_val}\n n={n_slow}/{n_total} ({pct:.1f}%) survivors slowdown"
-        plt.title(title_str, fontweight="bold")
-        
-        plt.ylabel(r"Growth Rate ($\times 10^{-2} min^{-1}$)")
-        plt.xlabel("Time (min)")
-        plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
-        
-        plt.legend(loc="upper right", frameon=True, fontsize=10)
-        plt.grid(True, linestyle=":", alpha=0.4)
-        sns.despine()
-        plt.tight_layout()
-        plt.show()
+        # Labels & Title
+        criteria_str = []
+        if require_growing_before: criteria_str.append("GrowBefore")
+        if require_growing_after: criteria_str.append("GrowAfter")
+        filter_lbl = "+".join(criteria_str) if criteria_str else "All"
 
-    # 7. Generate Summary Plot (Means Only)
+        title_str = (f"Lane {lane_val}: {cond_val}\n"
+                     f"Pop: {filter_lbl} | n={n_slow}/{n_total} ({pct:.1f}%)")
+        ax.set_title(title_str, fontweight="bold", fontsize=12)
+        
+        ax.set_ylabel(r"Growth Rate ($\times 10^{-2}$)")
+        ax.set_xlabel("Time (min)")
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
+        
+        # Only add legend to the first plot to save space, or all if preferred
+        if i == 0:
+            ax.legend(loc="upper right", frameon=True, fontsize=10)
+        
+        ax.grid(True, linestyle=":", alpha=0.4)
+        sns.despine(ax=ax)
+
+    # Turn off unused axes
+    for j in range(i + 1, len(axes)):
+        axes[j].axis('off')
+
+    plt.show()
+
+    # 7. Generate Summary Plots (Mean, Median, Mode)
+    # These remain full-width for detailed comparison
     if summary_data:
-        plt.figure(figsize=(12, 7))
-        
-        # Color palette
+        metrics = [
+            ('mean', 'Mean Growth Rate'),
+            ('median', 'Median Growth Rate'),
+            ('mode', f'Mode Growth Rate (Rounded to {mode_round_interval})')
+        ]
+
         palette = sns.color_palette("tab10", len(summary_data))
         
-        for i, item in enumerate(summary_data):
-            df_mean = item['data']
-            label = f"{item['label']} {item['n_str']}"
-            plt.plot(df_mean['time'], df_mean['growth_rate_smoothed'], 
-                     lw=2.5, color=palette[i], label=label)
+        for metric_key, metric_title in metrics:
+            plt.figure(figsize=(12, 7))
             
-        # Shading
-        if treatment_start is not None and treatment_end is not None:
-            plt.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1, label='Treatment')
+            for i, item in enumerate(summary_data):
+                series = item[metric_key]
+                label = f"{item['label']} {item['n_str']}"
+                plt.plot(series.index, series.values, lw=2.5, color=palette[i], label=label)
             
-        plt.axvline(check_time, color='green', linestyle='--', alpha=0.8, label=f'Selection (t={check_time})')
-        
-        plt.title("Summary: Mean Growth Rate of Slowdown Survivors", fontweight="bold")
-        plt.ylabel(r"Growth Rate ($\times 10^{-2} min^{-1}$)")
-        plt.xlabel("Time (min)")
-        plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
-        
-        plt.legend(loc="upper right", frameon=True, fontsize=10)
-        plt.grid(True, linestyle=":", alpha=0.4)
-        sns.despine()
-        plt.tight_layout()
-        plt.show()
+            if treatment_start is not None and treatment_end is not None:
+                plt.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1, label='Treatment')
+                
+            plt.axvline(check_time, color='green', linestyle='--', alpha=0.8, label=f'Selection (t={check_time})')
+            
+            full_title = f"Summary: {metric_title} of Slowdown Cells"
+            if require_growing_after: full_title += " (Survivors)"
+            
+            plt.title(full_title, fontweight="bold")
+            plt.ylabel(r"Growth Rate ($\times 10^{-2} min^{-1}$)")
+            plt.xlabel("Time (min)")
+            plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
+            
+            plt.legend(loc="upper right", frameon=True, fontsize=10)
+            plt.grid(True, linestyle=":", alpha=0.4)
+            sns.despine()
+            plt.tight_layout()
+            plt.show()
 
 def generate_slowdown_survivor_pdf(df: pd.DataFrame, 
                                    slowdown_params: dict, 
                                    treatment_start: float, 
                                    treatment_end: float, 
                                    check_time: float = 120.0,
-                                   filename: str = None):
+                                   filename: str = None,
+                                   require_growing_before: bool = True,
+                                   require_growing_after: bool = True):
     """
-    Generates a PDF report specifically for 'Slowdown Survivors'.
+    Generates a PDF report for cells that exhibit a slowdown at 'check_time',
+    filtered by growth status.
     
-    Definition: 
-      1. growing_after == True
-      2. Active slowdown event at 'check_time' (default 120 min).
-      
-    Plots: 3-panel trace (Length, Growth Rate, Acceleration) for every matching mother.
+    Args:
+        df: Input DataFrame.
+        slowdown_params: Params for visualizing detection logic.
+        require_growing_before: Filter for growing_before == True.
+        require_growing_after: Filter for growing_after == True.
     """
     if df is None: return
 
-    print(f"{'='*40}\n GENERATING SLOWDOWN SURVIVOR PDF \n{'='*40}")
+    print(f"{'='*40}\n GENERATING SLOWDOWN CELL PDF \n{'='*40}")
     
-    # 1. Generate Filename if not provided
+    # 1. Generate Filename
     if filename is None:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         current_folder = os.path.basename(os.getcwd())
-        filename = f"slowdown_survivor_traces_t{int(check_time)}_{current_folder}_{timestamp}.pdf"
+        # Append filter status to filename for clarity
+        tag = "survivors" if require_growing_after else "all_slowdowns"
+        filename = f"{tag}_slowdown_traces_t{int(check_time)}_{current_folder}_{timestamp}.pdf"
 
-    # 2. Identify Lane/Condition Columns (for Titles)
+    # 2. Identify Lane/Condition Columns
     lane_col = next((c for c in ['lane', 'lane_id', 'lane_num', 'position'] if c in df.columns), None)
     cond_col = next((c for c in ['condition', 'Condition'] if c in df.columns), None)
 
-    # 3. Filter for Slowdown Survivors
-    # A. Growing After
-    if 'growing_after' not in df.columns:
-        print("Warning: 'growing_after' column not found. Using all cells.")
-        candidates = df
-    else:
-        candidates = df[df['growing_after'] == True]
+    # 3. Filter Candidates
+    candidates = df.copy()
 
-    # B. Slowdown at Check Time
-    # Look for rows near check_time where slowdown is True
+    if require_growing_before:
+        if 'growing_before' in candidates.columns:
+            candidates = candidates[candidates['growing_before'] == True]
+            
+    if require_growing_after:
+        if 'growing_after' in candidates.columns:
+            candidates = candidates[candidates['growing_after'] == True]
+
+    # 4. Filter for Slowdown at Check Time
     target_rows = candidates[
         (candidates['time'] >= check_time - 2.0) & 
         (candidates['time'] <= check_time + 2.0) &
@@ -7284,25 +8457,23 @@ def generate_slowdown_survivor_pdf(df: pd.DataFrame,
     n_moms = len(final_mids)
     
     if n_moms == 0:
-        print(f"No survivors found with active slowdown at t={check_time}.")
+        print(f"No cells found matching criteria at t={check_time}.")
         return
 
-    print(f"Found {n_moms} Slowdown Survivors. Generating PDF...")
+    print(f"Found {n_moms} matching cells. Generating PDF...")
 
-    # 4. Setup Global Limits
+    # 5. Setup Global Limits
     global_tps = df["time"].unique()
     global_max_time = global_tps.max() if len(global_tps) > 0 else 600
     x_limit = np.ceil(global_max_time / 120) * 120
 
-    # 5. Generate PDF
+    # 6. Generate PDF
     with PdfPages(filename) as pdf:
         for mid in tqdm(sorted(final_mids), desc="Generating Pages"):
             
-            # Extract Trace
             trace = df[df['mother_id'] == mid].sort_values('time')
             t = trace['time'].values
             
-            # Extract Data
             y_raw = trace["log_length_cleaned"].values if "log_length_cleaned" in trace.columns else None
             y_sm = trace["log_length_smoothed"].values if "log_length_smoothed" in trace.columns else None
             d1_sm = trace["growth_rate_smoothed"].values if "growth_rate_smoothed" in trace.columns else None
@@ -7312,7 +8483,6 @@ def generate_slowdown_survivor_pdf(df: pd.DataFrame,
             
             divs = trace["division_event"].astype(float).fillna(0).astype(bool).values if "division_event" in trace.columns else np.zeros(len(t), dtype=bool)
 
-            # Re-run detection locally for visualization
             events = []
             if d1_sm is not None and d2_sm is not None:
                 events = _detect_and_measure_slowdowns(t, d1_sm, d2_sm, params=slowdown_params)
@@ -7333,9 +8503,7 @@ def generate_slowdown_survivor_pdf(df: pd.DataFrame,
                 cval = trace[cond_col].iloc[0]
                 title_parts.append(f"{cval}")
             
-            # Mark that this was selected for slowdown at X
             title_parts.append(f"[Slowdown @ {check_time}min]")
-            
             title_str = " | ".join(title_parts)
             
             # Plot 1: Log Length
@@ -7354,7 +8522,6 @@ def generate_slowdown_survivor_pdf(df: pd.DataFrame,
                 ax_d1.set_ylabel(r"Growth Rate ($\times 10^{-2} min^{-1}$)", fontweight='bold')
                 ax_d1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
                 
-                # Events
                 for ev in events:
                     mask = (t >= ev['start_t']) & (t <= ev['end_t'])
                     if not mask.any(): continue
@@ -7375,7 +8542,7 @@ def generate_slowdown_survivor_pdf(df: pd.DataFrame,
             if d2_sm is not None:
                 ax_d2.plot(t, d2_sm, c='#ff7f0e', lw=2)
                 ax_d2.axhline(0, c='k', ls='-', lw=0.8, alpha=0.5)
-                ax_d2.set_ylabel(r"Acceleration ($\times 10^{-4} min^{-2}$)", fontweight='bold')
+                ax_d2.set_ylabel(r"Accel ($\times 10^{-4} min^{-2}$)", fontweight='bold')
                 ax_d2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*10000:.1f}'))
                 
                 for ev in events:
@@ -7388,17 +8555,15 @@ def generate_slowdown_survivor_pdf(df: pd.DataFrame,
 
             # Common Formatting
             for ax in axes:
-                # Highlight Treatment
                 ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.15, zorder=0)
                 
-                # Treatment Text
+                # Treatment Label
                 y_min, y_max = ax.get_ylim()
                 text_y = y_max - (0.01 * (y_max - y_min))
                 treat_center = (treatment_start + treatment_end) / 2
                 ax.text(treat_center, text_y, "Treatment", color='darkred', alpha=1.0, 
                         ha='center', va='top', fontweight='bold', fontsize=8, zorder=10)
                 
-                # Highlight Slowdown Events
                 for ev in events:
                     ax.axvspan(ev['start_t'], ev['end_t'], color='green', alpha=0.1, zorder=0)
                 
@@ -7414,4 +8579,1903 @@ def generate_slowdown_survivor_pdf(df: pd.DataFrame,
             
     print(f"PDF saved to: {os.path.abspath(filename)}")
 
+def calculate_lane_survival(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates the survival percentage for each lane based on unique mothers.
+    Definition: % of (growing_after == True) given (growing_before == True).
+    N values represent unique mother_ids, not timepoints.
+    """
+    if df is None: return None
     
+    # 1. Identify Lane and Condition columns
+    lane_col = next((c for c in ['lane', 'lane_num', 'lane_id', 'position'] if c in df.columns), None)
+    cond_col = next((c for c in ['condition', 'Condition'] if c in df.columns), None)
+    
+    if not lane_col:
+        print("Error: Could not find a 'lane' column.")
+        return None
+
+    # 2. Filter: We only care about cells that were healthy BEFORE treatment
+    if 'growing_before' not in df.columns:
+        print("Error: 'growing_before' column missing.")
+        return None
+    
+    # Filter for growing_before population
+    base_pop = df[df['growing_before'] == True].copy()
+    
+    if base_pop.empty:
+        print("No cells found with growing_before == True.")
+        return None
+
+    # 3. Deduplicate to get one row per mother_id
+    # Since growing_before/growing_after are constant per mother, any row works.
+    unique_moms = base_pop.drop_duplicates(subset=['mother_id'])
+
+    # Ensure growing_after exists and is boolean (handle NaNs as False)
+    if 'growing_after' not in unique_moms.columns:
+        print("Warning: 'growing_after' missing. Assuming 0 survivors.")
+        unique_moms['growing_after'] = False
+    else:
+        unique_moms['growing_after'] = unique_moms['growing_after'].fillna(False).astype(bool)
+
+    # 4. Group by Lane (and Condition if available)
+    group_cols = [lane_col]
+    if cond_col: group_cols.append(cond_col)
+    
+    # Aggregation:
+    # n_before = Count of rows (since we already deduplicated to unique mothers)
+    # n_survivors = Sum of growing_after (True=1, False=0)
+    stats = unique_moms.groupby(group_cols)['growing_after'].agg(
+        n_before='count',
+        n_survivors='sum'
+    ).reset_index()
+    
+    # 5. Calculate Percentage
+    stats['survival_%'] = (stats['n_survivors'] / stats['n_before']) * 100.0
+    
+    # 6. Formatting & Printing
+    try:
+        stats = stats.sort_values(lane_col)
+    except: 
+        pass
+        
+    # --- NEW: Dynamic Column Width Calculation ---
+    cond_header = "Condition"
+    if cond_col and not stats.empty:
+        # Find the longest condition string, or default to header length if it's longer
+        max_cond_len = stats[cond_col].astype(str).map(len).max()
+        cond_width = max(len(cond_header), max_cond_len) + 2 # +2 for a little padding
+    else:
+        cond_width = len(cond_header) + 2
+
+    # Calculate total table width for the horizontal lines
+    # Lane(10) + |(3) + Cond(cond_width) + |(3) + N_b(10) + |(3) + N_a(10) + |(3) + Surv(10) = 42 + cond_width
+    total_width = 42 + cond_width
+    
+    print(f"{'='*total_width}\n SURVIVAL SUMMARY (Unique Mothers) \n{'='*total_width}")
+    print(f"{'Lane':<10} | {cond_header:<{cond_width}} | {'N(Before)':<10} | {'N(After)':<10} | {'Survival %'}")
+    print("-" * total_width)
+    
+    for _, row in stats.iterrows():
+        l_val = str(row[lane_col])
+        c_val = str(row[cond_col]) if cond_col else "N/A"
+        n_b = int(row['n_before'])
+        n_a = int(row['n_survivors'])
+        pct = row['survival_%']
+        
+        # Inject the dynamic cond_width into the f-string formatting
+        print(f"{l_val:<10} | {c_val:<{cond_width}} | {n_b:<10} | {n_a:<10} | {pct:.2f}%")
+        
+    print("-" * total_width)
+    
+    return stats
+
+def plot_slowdown_survivor_growth_rates_by_window(
+    df: pd.DataFrame, 
+    window_start: float,
+    window_end: float,
+    treatment_start: float = None, 
+    treatment_end: float = None,
+    require_growing_before: bool = True,
+    require_growing_after: bool = True,
+    mode_round_interval: float = 0.0005  # NEW ARGUMENT
+):
+    """
+    Plots growth_rate_smoothed vs time for cells that START a slowdown 
+    within the window [window_start, window_end].
+    
+    Layout: 2 Columns of plots for individual conditions.
+    """
+    if df is None:
+        print("Error: DataFrame is None.")
+        return
+
+    print(f"{'='*40}\n PLOTTING TRACES: SLOWDOWN STARTING {window_start}-{window_end} min \n{'='*40}")
+
+    # 1. Check Columns
+    lane_col = next((c for c in ['lane', 'lane_id', 'lane_num', 'position'] if c in df.columns), None)
+    cond_col = next((c for c in ['condition', 'Condition'] if c in df.columns), None)
+    
+    if 'slowdown_start' not in df.columns:
+        print("Error: 'slowdown_start' column missing. Please run the updated batch slowdown detection.")
+        return
+
+    if not lane_col:
+        print("Error: Could not find a 'lane' column.")
+        return
+    
+    # 2. Filter Base Population (Growth Criteria)
+    candidates = df.copy()
+
+    if require_growing_before:
+        if 'growing_before' in candidates.columns:
+            candidates = candidates[candidates['growing_before'] == True]
+        else:
+            print("Warning: 'growing_before' column missing. Skipping check.")
+            
+    if require_growing_after:
+        if 'growing_after' in candidates.columns:
+            candidates = candidates[candidates['growing_after'] == True]
+        else:
+            print("Warning: 'growing_after' column missing. Skipping check.")
+
+    if candidates.empty:
+        print("No cells matched the growth criteria.")
+        return
+
+    # 3. Filter for Slowdowns Starting in Window
+    # We look for rows where a slowdown is active AND the recorded start time is in range.
+    # slowdown_start is populated on rows where slowdown==True.
+    mask_window = (
+        (candidates['slowdown'] == True) & 
+        (candidates['slowdown_start'] >= window_start) & 
+        (candidates['slowdown_start'] <= window_end)
+    )
+    
+    slowdown_mids = candidates.loc[mask_window, 'mother_id'].unique()
+    
+    if len(slowdown_mids) == 0:
+        print(f"No mothers found with a slowdown starting between {window_start} and {window_end} min.")
+        return
+
+    print(f"Found {len(slowdown_mids)} Target Cells out of {candidates['mother_id'].nunique()} Base Candidates.")
+    
+    # 4. Extract Traces
+    slowdown_df = df[df['mother_id'].isin(slowdown_mids)].copy()
+    
+    # 5. Grouping
+    if cond_col:
+        groups = slowdown_df[[lane_col, cond_col]].drop_duplicates().sort_values(lane_col)
+    else:
+        groups = slowdown_df[[lane_col]].drop_duplicates().sort_values(lane_col)
+        groups['condition'] = "Unknown"
+
+    sns.set_theme(style="ticks", context="talk")
+    summary_data = []
+
+    # Helper for mode calculation
+    def calculate_custom_mode(series):
+        # Round to nearest interval
+        rounded = (series / mode_round_interval).round() * mode_round_interval
+        m = rounded.mode()
+        return m.iloc[0] if not m.empty else np.nan
+
+    # --- SETUP SUBPLOTS ---
+    n_groups = len(groups)
+    n_cols = 2
+    n_rows = math.ceil(n_groups / n_cols)
+    
+    # Create the figure for the grid
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows), constrained_layout=True)
+    axes = np.array(axes).flatten() # Flatten to 1D array for easy indexing
+
+    # 6. Generate Individual Plots
+    for i, (_, row) in enumerate(groups.iterrows()):
+        ax = axes[i]
+        lane_val = row[lane_col]
+        cond_val = row[cond_col] if cond_col else "Unknown"
+        
+        # A. Filter Data
+        if cond_col:
+            group_total = candidates[(candidates[lane_col] == lane_val) & (candidates[cond_col] == cond_val)]
+            group_slow = slowdown_df[(slowdown_df[lane_col] == lane_val) & (slowdown_df[cond_col] == cond_val)]
+        else:
+            group_total = candidates[candidates[lane_col] == lane_val]
+            group_slow = slowdown_df[slowdown_df[lane_col] == lane_val]
+            
+        if group_slow.empty: 
+            ax.text(0.5, 0.5, "No Data", ha='center', va='center')
+            continue
+        
+        # B. Stats
+        n_total = group_total['mother_id'].nunique()
+        n_slow = group_slow['mother_id'].nunique()
+        pct = (n_slow / n_total * 100.0) if n_total > 0 else 0.0
+        
+        # C. Calculate Aggregates
+        grouped_time = group_slow.groupby('time')['growth_rate_smoothed']
+        mean_trace = grouped_time.mean()
+        median_trace = grouped_time.median()
+        mode_trace = grouped_time.apply(calculate_custom_mode)
+
+        summary_data.append({
+            'label': f"Lane {lane_val}: {cond_val}",
+            'n_str': f"(n={n_slow})",
+            'mean': mean_trace,
+            'median': median_trace,
+            'mode': mode_trace
+        })
+
+        # D. Plotting
+        # Individual Traces
+        sns.lineplot(
+            data=group_slow,
+            x="time",
+            y="growth_rate_smoothed",
+            units="mother_id",
+            estimator=None,
+            color="gray",
+            alpha=0.3,
+            lw=1,
+            ax=ax
+        )
+        
+        # Mean Trace Overlay
+        ax.plot(mean_trace.index, mean_trace.values, color="#1f77b4", lw=3, label="Mean Growth Rate")
+        
+        # Shading: Treatment
+        if treatment_start is not None and treatment_end is not None:
+            ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1, zorder=0)
+        
+        # Shading: Selection Window
+        ax.axvspan(window_start, window_end, color='green', alpha=0.2, zorder=0, label="Selection Window")
+
+        # Title
+        criteria_str = []
+        if require_growing_before: criteria_str.append("GrowBefore")
+        if require_growing_after: criteria_str.append("GrowAfter")
+        filter_lbl = "+".join(criteria_str) if criteria_str else "All"
+
+        title_str = (f"Lane {lane_val}: {cond_val}\n"
+                     f"Pop: {filter_lbl} | n={n_slow}/{n_total} ({pct:.1f}%) | Start: {window_start}-{window_end}m")
+        ax.set_title(title_str, fontweight="bold", fontsize=12)
+        
+        ax.set_ylabel(r"Growth Rate ($\times 10^{-2}$)")
+        ax.set_xlabel("Time (min)")
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
+        
+        # Only add legend to the first plot
+        if i == 0:
+            ax.legend(loc="upper right", frameon=True, fontsize=10)
+        
+        ax.grid(True, linestyle=":", alpha=0.4)
+        sns.despine(ax=ax)
+
+    # Turn off unused axes
+    for j in range(i + 1, len(axes)):
+        axes[j].axis('off')
+
+    plt.show()
+
+    # 7. Generate Summary Plots (Mean, Median, Mode)
+    if summary_data:
+        metrics = [
+            ('mean', 'Mean Growth Rate'),
+            ('median', 'Median Growth Rate'),
+            ('mode', f'Mode Growth Rate (Rounded to {mode_round_interval})')
+        ]
+
+        palette = sns.color_palette("tab10", len(summary_data))
+        
+        for metric_key, metric_title in metrics:
+            plt.figure(figsize=(12, 7))
+            
+            for i, item in enumerate(summary_data):
+                # Retrieve the specific series (mean, median, or mode)
+                series = item[metric_key]
+                label = f"{item['label']} {item['n_str']}"
+                
+                plt.plot(series.index, series.values, 
+                         lw=2.5, color=palette[i], label=label)
+            
+            if treatment_start is not None and treatment_end is not None:
+                plt.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1, label='Treatment')
+                
+            plt.axvspan(window_start, window_end, color='green', alpha=0.2, label='Selection Window')
+            
+            title = f"Summary: {metric_title} (Slowdown Start: {window_start}-{window_end} min)"
+            plt.title(title, fontweight="bold")
+            plt.ylabel(r"Growth Rate ($\times 10^{-2} min^{-1}$)")
+            plt.xlabel("Time (min)")
+            plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x*100:.1f}'))
+            
+            plt.legend(loc="upper right", frameon=True, fontsize=10)
+            plt.grid(True, linestyle=":", alpha=0.4)
+            sns.despine()
+            plt.tight_layout()
+            plt.show()
+
+def plot_survivor_growth_rate_distribution_overlaid(
+    df: pd.DataFrame,
+    treatment_start: float,
+    win_start: float = None,  
+    win_end: float = None,    
+    require_growing_before: bool = True,
+    require_growing_after: bool = True,
+    bins: int = 20,
+    alpha: float = 0.4
+):
+    """
+    Calculates the mean growth rate for each survivor mother_id within the window 
+    [win_start, win_end] and plots overlaid probability histograms.
+    
+    Defaults:
+      win_start = treatment_start + 50
+      win_end   = treatment_start + 60
+    """
+    if df is None:
+        print("Error: DataFrame is None.")
+        return
+
+    # 1. Define Window (Handle Defaults)
+    if win_start is None:
+        win_start = treatment_start + 50.0
+    if win_end is None:
+        win_end = treatment_start + 60.0
+        
+    t1 = win_start
+    t2 = win_end
+    
+    print(f"{'='*40}\n GROWTH RATE DISTRIBUTION (OVERLAID) \n{'='*40}")
+    print(f"Window: {t1:.1f} min to {t2:.1f} min")
+
+    # 2. Filter Population
+    candidates = df.copy()
+    
+    if require_growing_before:
+        if 'growing_before' in candidates.columns:
+            candidates = candidates[candidates['growing_before'] == True]
+            
+    if require_growing_after:
+        if 'growing_after' in candidates.columns:
+            candidates = candidates[candidates['growing_after'] == True]
+
+    if candidates.empty:
+        print("No cells matched the growth criteria.")
+        return
+
+    # 3. Extract Data in Window
+    window_data = candidates[(candidates['time'] >= t1) & (candidates['time'] <= t2)]
+    
+    if window_data.empty:
+        print(f"No data points found in the window {t1}-{t2} min.")
+        return
+
+    # 4. Calculate Mean Growth Rate per Mother
+    cond_col = 'condition' if 'condition' in window_data.columns else 'Condition'
+    cols_to_group = ['mother_id', cond_col]
+        
+    mother_stats = window_data.groupby(cols_to_group)['growth_rate_smoothed'].mean().reset_index()
+    mother_stats.rename(columns={'growth_rate_smoothed': 'mean_growth_rate'}, inplace=True)
+    
+    # 5. Sorting (Sort legend by Lane if possible)
+    try:
+        sorted_conds, _, _ = _lane_sorting(candidates)
+        mother_stats[cond_col] = pd.Categorical(
+            mother_stats[cond_col].astype(str), 
+            categories=[str(c) for c in sorted_conds], 
+            ordered=True
+        )
+    except NameError:
+        pass 
+
+    # 6. Plotting
+    sns.set_theme(style="ticks", context="talk")
+    fig, ax = plt.subplots(figsize=(16, 8))
+    
+    sns.histplot(
+        data=mother_stats,
+        x='mean_growth_rate',
+        hue=cond_col,
+        stat='probability',   
+        common_norm=False,    
+        bins=bins,
+        kde=True,             
+        element="step",       
+        fill=True,            
+        alpha=alpha,          
+        palette='tab10',      
+        linewidth=2,
+        ax=ax
+    )
+
+    # 7. Formatting
+    try:
+        sns.move_legend(ax, "upper left", bbox_to_anchor=(1.05, 1), title="Condition")
+    except Exception:
+        print("Warning: Could not move legend (requires seaborn >= 0.11.2).")
+
+    # Dynamic Title
+    pop_type = "Survivor" if require_growing_after else "Cell"
+    
+    # Calculate offset for title clarity if relevant
+    offset_s = t1 - treatment_start
+    offset_e = t2 - treatment_start
+    time_str = f"{t1:.0f}-{t2:.0f} min (T+{offset_s:.0f} to T+{offset_e:.0f})"
+    
+    ax.set_title(f"{pop_type} Growth Rates | Window: {time_str}", fontweight='bold', pad=15)
+    
+    ax.set_xlabel(r"Mean Growth Rate (min$^{-1}$)", fontweight='bold')
+    ax.set_ylabel("Probability Density", fontweight='bold')
+
+    sns.despine()
+    ax.grid(True, linestyle=":", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_growth_rate_stats_by_condition(
+    df: pd.DataFrame,
+    require_growing_before: bool = True,
+    require_growing_after: bool = False,
+    treatment_start: float = None,
+    treatment_end: float = None,
+    mode_round_interval: float = 0.001,  # Updated default
+    plot_xmin: float = 0.0,              # New Range Control
+    plot_xmax: float = 240.0             # New Range Control
+):
+    """
+    Plots Mean, Median, and Mode growth rates vs Time for each condition.
+    Restricts the plot to the range [plot_xmin, plot_xmax].
+    
+    Mode Calculation: Data is first rounded to the nearest 'mode_round_interval' 
+    (default 0.001) before finding the most frequent value.
+    """
+    if df is None:
+        print("Error: DataFrame is None.")
+        return
+
+    print(f"{'='*40}\n PLOTTING GROWTH RATE STATISTICS (Mean/Median/Mode) \n{'='*40}")
+    print(f"Plot Range: {plot_xmin} to {plot_xmax} min")
+    
+    # 1. Filter Data (Population)
+    candidates = df.copy()
+    
+    if require_growing_before:
+        if 'growing_before' in candidates.columns:
+            candidates = candidates[candidates['growing_before'] == True]
+    
+    if require_growing_after:
+        if 'growing_after' in candidates.columns:
+            candidates = candidates[candidates['growing_after'] == True]
+            
+    if candidates.empty:
+        print("No cells matched the growth criteria.")
+        return
+        
+    if 'growth_rate_smoothed' not in candidates.columns:
+        print("Error: 'growth_rate_smoothed' column missing.")
+        return
+
+    # 2. Filter Data (Time Range)
+    # We filter data BEFORE calculating stats to speed it up and ensure the plot limits are respected
+    candidates = candidates[(candidates['time'] >= plot_xmin) & (candidates['time'] <= plot_xmax)]
+    
+    if candidates.empty:
+        print(f"No data points found in the range {plot_xmin}-{plot_xmax} min.")
+        return
+
+    # 3. Sort Conditions
+    try:
+        sorted_conds, _, _ = _lane_sorting(candidates)
+    except NameError:
+        sorted_conds = sorted(candidates['condition'].unique())
+
+    # 4. Calculate Statistics
+    print("Calculating statistics...")
+    
+    def calc_mode_rounded(series):
+        # Round to nearest interval
+        rounded = (series / mode_round_interval).round() * mode_round_interval
+        m = rounded.mode()
+        return m.iloc[0] if not m.empty else np.nan
+
+    cond_col = 'condition' if 'condition' in candidates.columns else 'Condition'
+    
+    stats = candidates.groupby(['time', cond_col])['growth_rate_smoothed'].agg(
+        Mean='mean',
+        Median='median',
+        Mode=calc_mode_rounded
+    ).reset_index()
+
+    # 5. Plotting
+    sns.set_theme(style="ticks", context="talk")
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    
+    metrics = ['Mean', 'Median', 'Mode']
+    
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        
+        sns.lineplot(
+            data=stats,
+            x='time',
+            y=metric,
+            hue=cond_col,
+            hue_order=sorted_conds,
+            palette='tab10',
+            lw=2.5,
+            ax=ax,
+            legend=(i == 0) # Only show legend on top plot
+        )
+        
+        # Treatment Shading
+        if treatment_start is not None and treatment_end is not None:
+            # Only shade if within plot range
+            start = max(plot_xmin, treatment_start)
+            end = min(plot_xmax, treatment_end)
+            if end > start:
+                ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.1, zorder=0)
+                
+                # Label only on top plot
+                if i == 0:
+                    y_min, y_max = ax.get_ylim()
+                    # Center text within the visible treatment window
+                    treat_center = (treatment_start + treatment_end) / 2
+                    if plot_xmin <= treat_center <= plot_xmax:
+                        ax.text(treat_center, y_max, "Treatment", 
+                                color='darkred', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+        # Formatting
+        ax.set_ylabel(f"{metric} Growth Rate\n($\\min^{{-1}}$)", fontweight='bold')
+        ax.grid(True, linestyle=":", alpha=0.4)
+        ax.axhline(0, color='black', lw=1, alpha=0.3)
+        
+        # Explicitly set X limits
+        ax.set_xlim(plot_xmin, plot_xmax)
+        
+        if metric == 'Mode':
+            ax.set_title(f"Mode (Rounded to nearest {mode_round_interval})", fontsize=11, loc='right')
+
+    # Legend
+    if axes[0].get_legend():
+        sns.move_legend(axes[0], "upper left", bbox_to_anchor=(1.02, 1), title="Condition", frameon=True)
+
+    axes[-1].set_xlabel("Time (min)", fontweight='bold')
+    axes[-1].xaxis.set_major_locator(ticker.MultipleLocator(60)) # Ticks every 60m for this range
+    
+    # Dynamic Title
+    pop_type = []
+    if require_growing_before: pop_type.append("Growing Before")
+    if require_growing_after: pop_type.append("Growing After")
+    if not pop_type: pop_type.append("All Cells")
+    
+    plt.suptitle(f"Growth Rate Statistics ({' + '.join(pop_type)})", fontweight='bold', y=0.95)
+    plt.subplots_adjust(right=0.85)
+    plt.show()
+
+# Slowdown analysis functions
+def get_candidate_mothers(df_data, df_lost, check_idxs):
+    """
+    Optimized filtering to find mother_ids where the slowdown interval 
+    ends at the experiment's final time, using the numeric slowdown_end column.
+    """
+    # 1. Filter candidates
+    candidates = df_lost.query("growing_after == True").loc[check_idxs].copy()
+    
+    # 2. Find the final time of the experiment
+    final_time = df_data["time"].max()
+    
+    # Extract only the necessary columns and drop NaNs to speed up grouping
+    meta = df_data.dropna(subset=["slowdown_end"])[["mother_id", "slowdown_end"]]
+    
+    # 3. Find eligible IDs (max slowdown_end matches final_time)
+    max_end = meta.groupby("mother_id")["slowdown_end"].max()
+    eligible_ids = max_end[np.isclose(max_end, final_time)].index
+    
+    # 4. Return sorted unique list
+    return (
+        candidates.loc[candidates["mother_id"].isin(eligible_ids), "mother_id"]
+        .dropna().unique().tolist()
+    )
+
+def plot_single_mother(df, mother_id, current_idx, total_count):
+    """
+    Fast plotting using matplotlib primitives (avoids Seaborn overhead).
+    """
+    # Fast filtering
+    subset = df.loc[df["mother_id"] == mother_id]
+    t = subset["time"].values
+    
+    fig, ax1 = plt.subplots(figsize=(10, 4))
+    
+    # Left Axis
+    ax1.plot(t, subset["log_length_smoothed"].values, color="red", label="log_length")
+    ax1.set_ylabel("log_length_smoothed", color="red")
+    ax1.tick_params(axis="y", labelcolor="red")
+    ax1.set_xlabel("time")
+    
+    # Right Axis
+    ax2 = ax1.twinx()
+    ax2.plot(t, subset["growth_rate_smoothed"].values, color="blue", label="growth_rate")
+    ax2.set_ylabel("growth_rate_smoothed", color="blue")
+    ax2.tick_params(axis="y", labelcolor="blue")
+    
+    ax1.set_title(f"Mother ID: {mother_id} (Idx {current_idx}/{total_count})")
+    plt.tight_layout()
+    plt.show()
+
+def filter_fast_survivors(max_lost_time, mother_machine_data, fresh_media_start, treatment_start, lanes=None, top_percent=10, gr_threshold=1.5):
+    """
+    Filters max_lost_time to keep only survivors whose top X% growth rate 
+    (within the specified time window) is >= a given threshold.
+    """
+    # 1. Base filter for survivors (and optionally specific lanes)
+    query_str = "growing_before == True and growing_after == True"
+    if lanes is not None:
+        query_str += f" and lane in {lanes}"
+    
+    df_survivors = max_lost_time.query(query_str)
+    
+    # 2. Extract growth rates for these specific mothers WITHIN the specific time window
+    mm_subset = mother_machine_data[
+        (mother_machine_data['mother_id'].isin(df_survivors['mother_id'])) &
+        (mother_machine_data['time'] >= fresh_media_start) &
+        (mother_machine_data['time'] <= treatment_start)
+    ]
+    
+    # 3. Calculate the quantile (e.g., top 10% = 0.90 quantile) for each mother
+    q_val = 1.0 - (top_percent / 100.0)
+    gr_quantiles = mm_subset.groupby('mother_id')['growth_rate_smoothed'].quantile(q_val)
+    
+    # 4. Scale threshold to absolute value (e.g. 1.5 -> 0.015) and identify passes
+    actual_threshold = gr_threshold / 100.0
+    passed_ids = gr_quantiles[gr_quantiles >= actual_threshold].index
+    
+    # 5. Filter the final dataframe
+    filtered_df = df_survivors[df_survivors['mother_id'].isin(passed_ids)].copy()
+    
+    # Print the summary stats directly from the function
+    print(f"Original survivors in target lanes: {len(df_survivors)}")
+    print(f"Filtered survivors (Top {top_percent}% GR >= {gr_threshold} x 10^-2 between {fresh_media_start} and {treatment_start} min): {len(filtered_df)}")
+    
+    return filtered_df
+
+# Lag time analysis functions
+def plot_lag_histograms(df: pd.DataFrame, 
+                        treatment_start: float,
+                        times_relative_to_treatment_start: list = [60, 120, 180, 240], 
+                        bin_width: float = 5.0,
+                        require_growing_before: bool = True,
+                        require_growing_after: bool = False,
+                        ylim: tuple = None): 
+    """
+    Plots probability density histograms of 'accum_lag_current' at specific timepoints relative to treatment start.
+    Filters based on growing_before and growing_after statuses.
+    
+    CRITICAL: The probability density is normalized to the INITIAL filtered population 
+    (i.e., cells that satisfy require_growing_before, regardless of growing_after). 
+    As cells die, the total area under the histogram will shrink to reflect the loss 
+    of the original population.
+    
+    Args:
+        ylim: Optional tuple to fix the y-axis limits (e.g., (0, 0.005)).
+    """
+    if df is None: return
+    if 'accum_lag_current' not in df.columns:
+        print("Error: 'accum_lag_current' column not found. Run calculate_accumulated_lag first.")
+        return
+
+    print(f"{'='*60}\n PLOTTING LAG HISTOGRAMS (NORMALIZED TO INITIAL POPULATION) \n{'='*60}")
+
+    # 1. Determine Initial Population (Before growing_after filter)
+    df_initial = df.copy()
+    if require_growing_before:
+        if 'growing_before' in df_initial.columns:
+            df_initial = df_initial[df_initial['growing_before'] == True]
+
+    if df_initial.empty:
+        print("Error: No data remaining after filtering for initial population (growing_before).")
+        return
+
+    # 2. Determine Grouping for Initial Counts
+    hue_col = None
+    hue_order = None
+    if 'condition' in df_initial.columns and df_initial['condition'].nunique() > 1:
+        hue_col = 'condition'
+    elif 'lane' in df_initial.columns:
+        hue_col = 'lane'
+        
+    if hue_col:
+        try:
+            if hue_col == 'condition':
+                # Attempt to use a local _lane_sorting function if it exists
+                hue_order, _, _ = _lane_sorting(df_initial)
+            else:
+                hue_order = sorted(df_initial[hue_col].unique())
+        except (NameError, Exception):
+            hue_order = sorted(df_initial[hue_col].unique())
+            
+    # Calculate the INITIAL population size for each group for true normalization
+    initial_cells = df_initial.drop_duplicates('mother_id')
+    if hue_col:
+        initial_counts = initial_cells[hue_col].value_counts().to_dict()
+        print("Initial population counts per condition (before 'growing_after' filter):")
+        for cond, count in initial_counts.items():
+            print(f"  - {cond}: {count} cells")
+    else:
+        initial_counts = {None: len(initial_cells)}
+        print(f"Initial population count (before 'growing_after' filter): {initial_counts[None]} cells")
+
+    # 3. Apply growing_after filter for the actual plotting data
+    df_filtered = df_initial.copy()
+    if require_growing_after:
+        if 'growing_after' in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered['growing_after'] == True]
+
+    if df_filtered.empty:
+        print("Error: No data remaining after filtering for survivors (growing_after).")
+        return
+
+    # 4. Setup Figure
+    n_t = len(times_relative_to_treatment_start)
+    cols = 2
+    rows = int(np.ceil(n_t / cols))
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 5 * rows), constrained_layout=True)
+    axes = np.array(axes).flatten() if hasattr(axes, 'flatten') else np.array([axes])
+    
+    # 5. Generate Plots
+    for i, rel_tp in enumerate(times_relative_to_treatment_start):
+        if i >= len(axes): break
+        ax = axes[i]
+        
+        # Calculate absolute timepoint
+        tp = treatment_start + rel_tp
+        
+        mask = (df_filtered['time'] >= tp - 2.0) & (df_filtered['time'] <= tp + 2.0)
+        subset = df_filtered[mask].copy()
+        
+        if subset.empty:
+            ax.text(0.5, 0.5, "No Data", ha='center', transform=ax.transAxes)
+            ax.set_title(f"Accumulated lag {rel_tp} mins after treatment start\n(n=0)", fontweight='bold')
+            ax.set_xlim(0, tp)
+            if ylim is not None:
+                ax.set_ylim(ylim)
+            continue
+            
+        subset['dist'] = (subset['time'] - tp).abs()
+        subset = subset.sort_values('dist').drop_duplicates('mother_id')
+        
+        # Calculate custom weights to normalize by INITIAL population density
+        if hue_col:
+            subset['weight'] = subset[hue_col].map(lambda x: 1.0 / (initial_counts.get(x, 1) * bin_width))
+        else:
+            subset['weight'] = 1.0 / (initial_counts[None] * bin_width)
+        
+        sns.histplot(
+            data=subset,
+            x='accum_lag_current',
+            weights='weight',     # Use our custom initial-population weights
+            hue=hue_col,
+            hue_order=hue_order,  
+            stat='count',         # 'count' with weights produces our custom density
+            common_norm=False,    
+            multiple="layer", 
+            element="step",
+            binwidth=bin_width,
+            kde=True,
+            ax=ax,
+            palette="tab10",
+            alpha=0.3
+        )
+        
+        ax.set_title(f"Accumulated lag {rel_tp} mins after treatment start\n(surviving n={len(subset)})", fontweight='bold')
+        ax.set_xlabel("Accumulated Lag (min)")
+        ax.set_ylabel("Density (Norm. to Initial Pop)")
+        
+        # Handle axis limits
+        ax.set_xlim(0, max(tp, 10))  # Prevent issues if tp is exactly 0
+        if ylim is not None:
+            ax.set_ylim(ylim)
+            
+        ax.axvline(0, color='k', linestyle='--', alpha=0.5, linewidth=1)
+        ax.grid(True, linestyle=':', alpha=0.4)
+
+    # Turn off unused axes
+    for j in range(i + 1, len(axes)):
+        axes[j].axis('off')
+        
+    plt.show()
+
+def plot_interval_lag_histograms(df: pd.DataFrame, 
+                                 treatment_start: float,
+                                 intervals_relative_to_treatment_start: list = [(60, 180), (60, 240)], 
+                                 bin_width: float = 5.0,
+                                 require_growing_before: bool = True,
+                                 require_growing_after: bool = False): 
+    """
+    Plots probability density histograms of the CHANGE in 'accum_lag_current' over specific time intervals relative to treatment start.
+    Filters based on growing_before and growing_after statuses.
+    
+    CRITICAL: The probability density is normalized to the INITIAL filtered population 
+    (e.g., all cells that were growing_before).
+    """
+    if df is None: return
+    if 'accum_lag_current' not in df.columns:
+        print("Error: 'accum_lag_current' column not found.")
+        return
+
+    print(f"{'='*60}\n PLOTTING INTERVAL LAG HISTOGRAMS (NORMALIZED TO INITIAL POPULATION) \n{'='*60}")
+
+    # 1. Filter Population
+    df_filtered = df.copy()
+    if require_growing_before:
+        if 'growing_before' in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered['growing_before'] == True]
+            
+    if require_growing_after:
+        if 'growing_after' in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered['growing_after'] == True]
+
+    if df_filtered.empty:
+        print("Error: No data remaining after filtering.")
+        return
+
+    # 2. Grouping & Enforcing Order/Color Consistency
+    hue_col = None
+    hue_order = None
+    if 'condition' in df_filtered.columns and df_filtered['condition'].nunique() > 1:
+        hue_col = 'condition'
+    elif 'lane' in df_filtered.columns:
+        hue_col = 'lane'
+        
+    if hue_col:
+        try:
+            if hue_col == 'condition':
+                hue_order, _, _ = _lane_sorting(df_filtered)
+            else:
+                hue_order = sorted(df_filtered[hue_col].unique())
+        except NameError:
+            hue_order = sorted(df_filtered[hue_col].unique())
+            
+    # Calculate the INITIAL population size for each group for true normalization
+    initial_cells = df_filtered.drop_duplicates('mother_id')
+    if hue_col:
+        initial_counts = initial_cells[hue_col].value_counts().to_dict()
+    else:
+        initial_counts = {None: len(initial_cells)}
+        
+    n_i = len(intervals_relative_to_treatment_start)
+    cols = 2
+    rows = int(np.ceil(n_i / cols))
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 5 * rows), constrained_layout=True)
+    axes = np.array(axes).flatten() if hasattr(axes, 'flatten') else np.array([axes])
+    
+    for i, (rel_start, rel_end) in enumerate(intervals_relative_to_treatment_start):
+        if i >= len(axes): break
+        ax = axes[i]
+        
+        # Calculate absolute timepoints
+        t_start = treatment_start + rel_start
+        t_end = treatment_start + rel_end
+        
+        # Get Data Start
+        mask_start = (df_filtered['time'] >= t_start - 2.0) & (df_filtered['time'] <= t_start + 2.0)
+        df_start = df_filtered[mask_start].copy()
+        df_start['dist'] = (df_start['time'] - t_start).abs()
+        df_start = df_start.sort_values('dist').drop_duplicates('mother_id')
+        df_start = df_start.set_index('mother_id')[['accum_lag_current']].rename(columns={'accum_lag_current': 'lag_start'})
+        
+        # Get Data End
+        mask_end = (df_filtered['time'] >= t_end - 2.0) & (df_filtered['time'] <= t_end + 2.0)
+        df_end = df_filtered[mask_end].copy()
+        df_end['dist'] = (df_end['time'] - t_end).abs()
+        df_end = df_end.sort_values('dist').drop_duplicates('mother_id')
+        df_end = df_end.set_index('mother_id')[['accum_lag_current']].rename(columns={'accum_lag_current': 'lag_end'})
+        
+        # Merge
+        merged = df_start.join(df_end, how='inner')
+        merged['lag_delta'] = merged['lag_end'] - merged['lag_start']
+        
+        # Add Meta
+        if hue_col:
+            mapping = df_filtered[['mother_id', hue_col]].drop_duplicates('mother_id').set_index('mother_id')[hue_col]
+            merged[hue_col] = merged.index.map(mapping)
+        
+        if merged.empty:
+            ax.text(0.5, 0.5, "No Overlapping Data", ha='center', transform=ax.transAxes)
+            ax.set_title(f"Accumulated lag between {rel_start}-{rel_end} mins after treatment start\n(n=0)", fontweight='bold')
+            continue
+            
+        # Calculate custom weights to normalize by INITIAL population density
+        if hue_col:
+            merged['weight'] = merged[hue_col].map(lambda x: 1.0 / (initial_counts[x] * bin_width))
+        else:
+            merged['weight'] = 1.0 / (initial_counts[None] * bin_width)
+            
+        sns.histplot(
+            data=merged,
+            x='lag_delta',
+            weights='weight',     # Use our custom initial-population weights
+            hue=hue_col,
+            hue_order=hue_order,  
+            stat='count',         # 'count' with weights produces our custom density
+            common_norm=False,    
+            multiple="layer", 
+            element="step",
+            binwidth=bin_width,
+            kde=True,
+            ax=ax,
+            palette="tab10",
+            alpha=0.3
+        )
+        
+        duration = t_end - t_start
+        ax.set_title(f"Accumulated lag between {rel_start}-{rel_end} mins after treatment start\n(surviving n={len(merged)})", fontweight='bold')
+        ax.set_xlabel(f"Accumulated Lag in Window (min)")
+        ax.set_ylabel("Density (Norm. to Initial Pop)")
+        ax.set_xlim(0, duration)
+        
+        ax.axvline(0, color='k', linestyle='--', alpha=0.5, linewidth=1)
+        ax.grid(True, linestyle=':', alpha=0.4)
+
+    # Turn off unused axes
+    for j in range(i + 1, len(axes)):
+        axes[j].axis('off')
+        
+    plt.show()
+
+def generate_interval_lag_pdf(
+    df: pd.DataFrame, 
+    treatment_start: float,
+    treatment_end: float,
+    interval_relative_to_treatment_start: tuple = (60, 120),
+    min_lag_amount: float = 10.0,
+    max_lag_amount: float = 16.0,
+    require_growing_before: bool = True,
+    require_growing_after: bool = False,
+    max_IDs_per_condition: int = 50,
+    filename: str = None
+):
+    """
+    Identifies cells with a specific amount of 'accum_lag_current' over a given time interval,
+    and generates a 3-panel PDF report (Length, Growth Rate, Acceleration) for those individual cells.
+    The PDF is split into sections based on 'condition' (or 'lane').
+    """
+    if df is None: return
+    if 'accum_lag_current' not in df.columns:
+        print("Error: 'accum_lag_current' column not found.")
+        return
+
+    rel_start, rel_end = interval_relative_to_treatment_start
+    print(f"{'='*60}")
+    print(f" GENERATING INTERVAL LAG PDF")
+    print(f" Interval: T+{rel_start} to T+{rel_end} min")
+    print(f" Target Lag Range: {min_lag_amount} to {max_lag_amount} min (inclusive)")
+    print(f"{'='*60}")
+
+    # 1. Filter Population
+    df_filtered = df.copy()
+    if require_growing_before:
+        if 'growing_before' in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered['growing_before'] == True]
+            
+    if require_growing_after:
+        if 'growing_after' in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered['growing_after'] == True]
+
+    if df_filtered.empty:
+        print("Error: No data remaining after filtering.")
+        return
+
+    # 2. Calculate absolute timepoints
+    t_start = treatment_start + rel_start
+    t_end = treatment_start + rel_end
+    
+    # Get Data Start
+    mask_start = (df_filtered['time'] >= t_start - 2.0) & (df_filtered['time'] <= t_start + 2.0)
+    df_start = df_filtered[mask_start].copy()
+    df_start['dist'] = (df_start['time'] - t_start).abs()
+    df_start = df_start.sort_values('dist').drop_duplicates('mother_id')
+    df_start = df_start.set_index('mother_id')[['accum_lag_current']].rename(columns={'accum_lag_current': 'lag_start'})
+    
+    # Get Data End
+    mask_end = (df_filtered['time'] >= t_end - 2.0) & (df_filtered['time'] <= t_end + 2.0)
+    df_end = df_filtered[mask_end].copy()
+    df_end['dist'] = (df_end['time'] - t_end).abs()
+    df_end = df_end.sort_values('dist').drop_duplicates('mother_id')
+    df_end = df_end.set_index('mother_id')[['accum_lag_current']].rename(columns={'accum_lag_current': 'lag_end'})
+    
+    # Merge and calculate lag_delta
+    merged = df_start.join(df_end, how='inner')
+    merged['lag_delta'] = merged['lag_end'] - merged['lag_start']
+    
+    if merged.empty:
+        print("No cells found that overlap the entire interval.")
+        return
+
+    # Filter to targeted lag amounts
+    target_moms_df = merged[(merged['lag_delta'] >= min_lag_amount) & (merged['lag_delta'] <= max_lag_amount)].copy()
+    if target_moms_df.empty:
+        print(f"No cells found with a lag delta between {min_lag_amount} and {max_lag_amount} min.")
+        return
+        
+    # 3. Grouping & Sorting by condition
+    group_col = None
+    if 'condition' in df_filtered.columns and df_filtered['condition'].nunique() > 1:
+        group_col = 'condition'
+    elif 'lane' in df_filtered.columns:
+        group_col = 'lane'
+        
+    if group_col:
+        mapping = df_filtered[['mother_id', group_col]].drop_duplicates('mother_id').set_index('mother_id')[group_col]
+        target_moms_df[group_col] = target_moms_df.index.map(mapping)
+        
+        try:
+            if group_col == 'condition':
+                hue_order, _, _ = _lane_sorting(df_filtered)
+            else:
+                hue_order = sorted(target_moms_df[group_col].dropna().unique())
+        except NameError:
+            hue_order = sorted(target_moms_df[group_col].dropna().unique())
+            
+        groups_to_plot = [g for g in hue_order if g in target_moms_df[group_col].values]
+    else:
+        target_moms_df['group'] = 'All'
+        group_col = 'group'
+        groups_to_plot = ['All']
+
+    if filename is None:
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'interval_lag_{min_lag_amount}to{max_lag_amount}m_report_{timestamp}.pdf'
+
+    x_max = df_filtered['time'].max()
+    x_limit = np.ceil(x_max / 120) * 120
+
+    print(f"Generating PDF: {filename}...")
+    
+    with PdfPages(filename) as pdf:
+        for group in groups_to_plot:
+            group_moms = target_moms_df[target_moms_df[group_col] == group].index.tolist()
+            if len(group_moms) == 0:
+                continue
+                
+            # Create a section title page for the condition
+            fig_title, ax_title = plt.subplots(figsize=(8.0, 7.0))
+            ax_title.axis('off')
+            title_text = f"Condition: {group}\n\n"
+            title_text += f"{len(group_moms)} cells found\n"
+            title_text += f"Target Lag Range: {min_lag_amount} - {max_lag_amount} min\n"
+            title_text += f"Interval: T+{rel_start} to T+{rel_end} min"
+            ax_title.text(0.5, 0.5, title_text, ha='center', va='center', fontsize=16, fontweight='bold')
+            pdf.savefig(fig_title)
+            plt.close(fig_title)
+            
+            # Subsample to prevent massive PDF if desired
+            if max_IDs_per_condition is not None and len(group_moms) > max_IDs_per_condition:
+                print(f"  - {group}: Plotting {max_IDs_per_condition} of {len(group_moms)} cells")
+                group_moms = group_moms[:max_IDs_per_condition]
+            else:
+                print(f"  - {group}: Plotting all {len(group_moms)} cells")
+                
+            for mid in tqdm(group_moms, desc=f"Plotting {group}"):
+                trace = df_filtered[df_filtered['mother_id'] == mid].sort_values('time')
+                t = trace['time'].values
+                
+                y_raw = trace['log_length_cleaned'].values if 'log_length_cleaned' in trace.columns else None
+                y_sm = trace['log_length_smoothed'].values
+                d1_sm = trace['growth_rate_smoothed'].values if 'growth_rate_smoothed' in trace.columns else None
+                d2_col = 'second_deriv_smoothed' if 'second_deriv_smoothed' in trace.columns else '2nd_deriv_smoothed'
+                d2_sm = trace[d2_col].values if d2_col in trace.columns else None
+                
+                divs = trace['division_event'].astype(float).fillna(0).astype(bool).values if 'division_event' in trace.columns else np.zeros(len(t), dtype=bool)
+                
+                fig, axes = plt.subplots(3, 1, figsize=(8.0, 7.0), sharex=False)
+                plt.subplots_adjust(top=0.92, bottom=0.1, left=0.12, right=0.95, hspace=0.3)
+                (ax_len, ax_d1, ax_d2) = (axes[0], axes[1], axes[2])
+                
+                # Fetch exact lag amount to put in the title
+                cell_lag = target_moms_df.loc[mid, 'lag_delta']
+                
+                title_parts = [f"Mother {mid}"]
+                if group_col != 'group':
+                    title_parts.append(f"{group}")
+                title_parts.append(f"Interval Lag: {cell_lag:.1f}m")
+                fig.suptitle(' | '.join(title_parts), fontweight='bold', fontsize=12)
+                
+                # Top panel: Length
+                if y_raw is not None:
+                    ax_len.scatter(t, y_raw, c='gray', s=10, alpha=0.3, zorder=1)
+                ax_len.plot(t, y_sm, c='#d62728', lw=2, label='Smoothed', zorder=2)
+                if divs.any() and y_raw is not None:
+                    valid_divs = divs & np.isfinite(y_raw)
+                    ax_len.scatter(t[valid_divs], y_raw[valid_divs], c='cyan', s=30, marker='o', edgecolors='k', zorder=3, label='Division')
+                ax_len.set_ylabel('ln[Length ($\\mu$m)]', fontweight='bold')
+                ax_len.set_ylim(0.25, 3.25)
+                
+                # Middle panel: Growth Rate
+                if d1_sm is not None:
+                    ax_d1.plot(t, d1_sm, c='#1f77b4', lw=2)
+                    ax_d1.set_ylabel('Rate ($\\times 10^{-2} min^{-1}$)', fontweight='bold')
+                    ax_d1.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x * 100:.1f}'))
+                    ax_d1.set_ylim(-0.001, 0.025)
+                
+                # Bottom panel: Acceleration
+                if d2_sm is not None:
+                    ax_d2.plot(t, d2_sm, c='#ff7f0e', lw=2)
+                    ax_d2.axhline(0, c='k', ls='-', lw=0.8, alpha=0.5)
+                    ax_d2.set_ylabel('Accel ($\\times 10^{-4} min^{-2}$)', fontweight='bold')
+                    ax_d2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, pos: f'{x * 10000:.1f}'))
+                    ax_d2.set_ylim(-0.00025, 0.00025)
+                    
+                ax_d2.set_xlabel('Time (min)', fontweight='bold')
+                
+                # Format all axes
+                for ax in axes:
+                    if treatment_start is not None and treatment_end is not None:
+                        ax.axvspan(treatment_start, treatment_end, color='darkred', alpha=0.15, zorder=0)
+                        if ax == ax_len:
+                            treat_center = (treatment_start + treatment_end) / 2
+                            y_min, y_max = ax.get_ylim()
+                            text_y = y_max - 0.05 * (y_max - y_min)
+                            ax.text(treat_center, text_y, 'Treatment', color='darkred', ha='center', va='top', fontweight='bold', fontsize=8, alpha=0.8)
+                    
+                    # Highlight the interval being inspected in yellow
+                    ax.axvspan(t_start, t_end, color='yellow', alpha=0.15, zorder=0)
+                    if ax == ax_len:
+                        interval_center = (t_start + t_end) / 2
+                        ax.text(interval_center, text_y, 'Window', color='olive', ha='center', va='top', fontweight='bold', fontsize=8, alpha=0.8)
+                            
+                    ax.set_xlim(0, x_limit)
+                    ax.xaxis.set_major_locator(ticker.MultipleLocator(120))
+                    ax.xaxis.set_minor_locator(ticker.MultipleLocator(60))
+                    ax.grid(True, which='major', ls='-', alpha=0.4)
+                    ax.grid(True, which='minor', ls=':', alpha=0.2)
+                    
+                pdf.savefig(fig)
+                plt.close(fig)
+                
+    print(f"Done. Report saved to {os.path.abspath(filename)}")
+
+def compare_interval_lag_between_lanes(
+    df: pd.DataFrame,
+    treatment_start: float,
+    lane1: Any = 0,
+    lane2: Any = 1,
+    interval_start_relative: float = 0,
+    times_relative_to_treatment_start: List[float] = [30, 60, 90, 120, 180, 240],
+    require_growing_before: bool = True,
+    require_growing_after: bool = True,
+    bin_width: float = 3.0
+) -> pd.DataFrame:
+    """
+    Calculates the differences in the mean, median, and mode of the interval lag 
+    (change in accumulated lag) between two defined lanes.
+    
+    The intervals are calculated from `interval_start_relative` to each time 
+    in `times_relative_to_treatment_start`.
+    """
+    if df is None: return None
+    if 'accum_lag_current' not in df.columns:
+        print("Error: 'accum_lag_current' column not found.")
+        return None
+
+    print(f"\n{'='*65}")
+    print(f" COMPARING INTERVAL LAG: LANE {lane1} vs LANE {lane2} ")
+    print(f" Interval Start: T+{interval_start_relative} min")
+    print(f"{'='*65}")
+
+    # 1. Filter Population
+    df_filtered = df.copy()
+    if require_growing_before and 'growing_before' in df_filtered.columns:
+        df_filtered = df_filtered[df_filtered['growing_before'] == True]
+    if require_growing_after and 'growing_after' in df_filtered.columns:
+        df_filtered = df_filtered[df_filtered['growing_after'] == True]
+
+    if df_filtered.empty:
+        print("Error: No data remaining after filtering.")
+        return None
+
+    # Identify the appropriate lane column
+    lane_col = next((c for c in ['lane', 'lane_id', 'lane_num', 'position'] if c in df_filtered.columns), None)
+    if not lane_col:
+        print("Error: Could not find a 'lane' column in the DataFrame.")
+        return None
+
+    def calculate_custom_mode(series, interval):
+        """Finds the mode by rounding values to the specified bin_width."""
+        if series.empty: return np.nan
+        # Round to nearest bin
+        rounded = (series / interval).round() * interval
+        m = rounded.mode()
+        return m.iloc[0] if not m.empty else np.nan
+
+    # 2. Extract Base Time Data (The start of the interval)
+    t_start = treatment_start + interval_start_relative
+    
+    mask_start = (df_filtered['time'] >= t_start - 2.0) & (df_filtered['time'] <= t_start + 2.0)
+    df_start = df_filtered[mask_start].copy()
+    if df_start.empty:
+        print(f"Error: No data found around start time {t_start} min.")
+        return None
+        
+    df_start['dist'] = (df_start['time'] - t_start).abs()
+    df_start = df_start.sort_values('dist').drop_duplicates('mother_id')
+    df_start = df_start.set_index('mother_id')[['accum_lag_current']].rename(columns={'accum_lag_current': 'lag_start'})
+    
+    lane_mapping = df_filtered[['mother_id', lane_col]].drop_duplicates('mother_id').set_index('mother_id')[lane_col]
+
+    results = []
+
+    # 3. Iterate over the requested times
+    for rel_end in times_relative_to_treatment_start:
+        t_end = treatment_start + rel_end
+        
+        mask_end = (df_filtered['time'] >= t_end - 2.0) & (df_filtered['time'] <= t_end + 2.0)
+        df_end = df_filtered[mask_end].copy()
+        
+        if df_end.empty:
+            continue
+            
+        df_end['dist'] = (df_end['time'] - t_end).abs()
+        df_end = df_end.sort_values('dist').drop_duplicates('mother_id')
+        df_end = df_end.set_index('mother_id')[['accum_lag_current']].rename(columns={'accum_lag_current': 'lag_end'})
+        
+        # Merge and calculate delta (lag_end - lag_start)
+        merged = df_start.join(df_end, how='inner')
+        merged['lag_delta'] = merged['lag_end'] - merged['lag_start']
+        merged[lane_col] = merged.index.map(lane_mapping)
+        
+        # Split into lanes
+        l1_data = merged[merged[lane_col] == lane1]['lag_delta'].dropna()
+        l2_data = merged[merged[lane_col] == lane2]['lag_delta'].dropna()
+        
+        # Calculate Stats
+        l1_m = l1_data.mean() if not l1_data.empty else np.nan
+        l1_med = l1_data.median() if not l1_data.empty else np.nan
+        l1_mo = calculate_custom_mode(l1_data, bin_width) if not l1_data.empty else np.nan
+        
+        l2_m = l2_data.mean() if not l2_data.empty else np.nan
+        l2_med = l2_data.median() if not l2_data.empty else np.nan
+        l2_mo = calculate_custom_mode(l2_data, bin_width) if not l2_data.empty else np.nan
+        
+        # Calculate Differences (Lane 1 - Lane 2)
+        diff_m = l1_m - l2_m if (pd.notna(l1_m) and pd.notna(l2_m)) else np.nan
+        diff_med = l1_med - l2_med if (pd.notna(l1_med) and pd.notna(l2_med)) else np.nan
+        diff_mo = l1_mo - l2_mo if (pd.notna(l1_mo) and pd.notna(l2_mo)) else np.nan
+        
+        results.append({
+            'Time_Relative': rel_end,
+            f'Lane_{lane1}_n': len(l1_data),
+            f'Lane_{lane2}_n': len(l2_data),
+            f'Lane_{lane1}_Mean': l1_m,
+            f'Lane_{lane2}_Mean': l2_m,
+            'Diff_Mean': diff_m,
+            f'Lane_{lane1}_Median': l1_med,
+            f'Lane_{lane2}_Median': l2_med,
+            'Diff_Median': diff_med,
+            f'Lane_{lane1}_Mode': l1_mo,
+            f'Lane_{lane2}_Mode': l2_mo,
+            'Diff_Mode': diff_mo
+        })
+
+    results_df = pd.DataFrame(results)
+    
+    # 4. Print Summary Table
+    if not results_df.empty:
+        print(f"Differences (Lane {lane1} - Lane {lane2})")
+        print(f"{'Time':<6} | {'N1':<4} | {'N2':<4} | {'Mean Diff':<10} | {'Median Diff':<11} | {'Mode Diff':<9}")
+        print("-" * 65)
+        for _, row in results_df.iterrows():
+            t_val = int(row['Time_Relative'])
+            n1 = int(row[f'Lane_{lane1}_n'])
+            n2 = int(row[f'Lane_{lane2}_n'])
+            
+            m_str = f"{row['Diff_Mean']:.2f}" if pd.notna(row['Diff_Mean']) else "NaN"
+            md_str = f"{row['Diff_Median']:.2f}" if pd.notna(row['Diff_Median']) else "NaN"
+            mo_str = f"{row['Diff_Mode']:.2f}" if pd.notna(row['Diff_Mode']) else "NaN"
+            
+            print(f"T+{t_val:<4} | {n1:<4} | {n2:<4} | {m_str:<10} | {md_str:<11} | {mo_str:<9}")
+            
+    return results_df
+
+def calculate_survival_per_lag_bin(
+    df: pd.DataFrame,
+    treatment_start: float,
+    times_relative_to_treatment_start: List[float] = [30, 60, 90, 120, 180, 240],
+    bin_width: float = 3.0,
+    require_growing_before: bool = True
+) -> pd.DataFrame:
+    """
+    Calculates the survival percentage for cells grouped by their accumulated lag bin.
+    
+    'All cells' defined by require_growing_before=True.
+    'Survivors' defined by those cells that also have growing_after=True.
+    """
+    if df is None or df.empty: return None
+    if 'accum_lag_current' not in df.columns:
+        print("Error: 'accum_lag_current' column not found.")
+        return None
+        
+    print(f"\n{'='*65}")
+    print(f" CALCULATING SURVIVAL PERCENTAGES PER LAG BIN (Width: {bin_width}m) ")
+    print(f"{'='*65}")
+
+    # 1. Base filter for "All Cells"
+    df_filtered = df.copy()
+    if require_growing_before and 'growing_before' in df_filtered.columns:
+        df_filtered = df_filtered[df_filtered['growing_before'] == True]
+        
+    if df_filtered.empty:
+        print("Error: No data remaining after filtering for 'growing_before'.")
+        return None
+        
+    lane_col = next((c for c in ['lane', 'lane_id', 'lane_num', 'position'] if c in df_filtered.columns), None)
+    if not lane_col:
+        print("Error: Could not find a 'lane' column.")
+        return None
+        
+    # Get standard mapping for lane and growing_after per mother
+    mother_info = df_filtered[['mother_id', lane_col, 'growing_after']].drop_duplicates('mother_id').set_index('mother_id')
+    
+    all_results = []
+    
+    # 2. Iterate over the requested times
+    for rel_time in times_relative_to_treatment_start:
+        t_eval = treatment_start + rel_time
+        
+        # Extract data close to t_eval (+/- 2 mins) to get the lag at that time
+        mask = (df_filtered['time'] >= t_eval - 2.0) & (df_filtered['time'] <= t_eval + 2.0)
+        df_time = df_filtered[mask].copy()
+        
+        if df_time.empty:
+            continue
+            
+        # Keep the closest time point per mother
+        df_time['dist'] = (df_time['time'] - t_eval).abs()
+        df_time = df_time.sort_values('dist').drop_duplicates('mother_id')
+        
+        # Join with mother info (lane & survival status)
+        df_time = df_time.set_index('mother_id').join(mother_info, rsuffix='_info', how='inner')
+        
+        # Handle potential column overlaps from the join
+        lane_c = lane_col + '_info' if lane_col + '_info' in df_time.columns else lane_col
+        ga_c = 'growing_after_info' if 'growing_after_info' in df_time.columns else 'growing_after'
+        
+        df_time['lag'] = df_time['accum_lag_current']
+        df_time = df_time.dropna(subset=['lag'])
+        
+        if df_time.empty:
+            continue
+            
+        # 3. Assign to bins based on bin_width
+        df_time['bin_start'] = np.floor(df_time['lag'] / bin_width) * bin_width
+        
+        # 4. Group by Lane and Bin
+        grouped = df_time.groupby([lane_c, 'bin_start'])
+        
+        for (lane_val, bin_val), group in grouped:
+            total_cells = len(group)
+            
+            # Count True values in growing_after
+            survivors = group[ga_c].fillna(False).astype(bool).sum() 
+            surv_pct = (survivors / total_cells) * 100.0 if total_cells > 0 else 0.0
+            
+            bin_end = bin_val + bin_width
+            bin_label = f"[{bin_val:g}, {bin_end:g})"
+            
+            # Use lowercase keys for the dataframe columns
+            all_results.append({
+                'time_relative': rel_time,
+                'lane': lane_val,
+                'bin_start': bin_val,
+                'bin_label': bin_label,
+                'total_cells': total_cells,
+                'survivors': int(survivors),
+                'survival_percentage': surv_pct
+            })
+            
+    if not all_results:
+        print("No data extracted for the requested times.")
+        return pd.DataFrame()
+        
+    results_df = pd.DataFrame(all_results)
+    
+    # Sort sequentially for clean output
+    results_df = results_df.sort_values(by=['time_relative', 'lane', 'bin_start']).reset_index(drop=True)
+    
+    return results_df
+
+
+def plot_survival_vs_lag_bin(
+    survival_df: pd.DataFrame, 
+    lane: int, 
+    time_relative: float
+):
+    """
+    Plots survival_percentage against bin_start for a specified lane and time_relative.
+    Displays the plot inline in the notebook.
+    """
+    if survival_df is None or survival_df.empty:
+        print("Error: Provided DataFrame is empty or None.")
+        return
+        
+    # Filter the dataframe for the specific lane and relative time
+    plot_df = survival_df[(survival_df['lane'] == lane) & (survival_df['time_relative'] == time_relative)].copy()
+    
+    if plot_df.empty:
+        print(f"No data found for lane {lane} at relative time {time_relative}.")
+        return
+        
+    # Sort just in case to ensure a clean line plot
+    plot_df = plot_df.sort_values('bin_start')
+
+    fig, ax = plt.subplots(figsize=(8.0, 5.0))
+    
+    # Plotting line with circular markers
+    ax.plot(plot_df['bin_start'], plot_df['survival_percentage'], marker='o', 
+            linestyle='-', color='#1f77b4', lw=2, markersize=6)
+    
+    # Formatting
+    ax.set_title(f"Survival Percentage vs Accumulated Lag\nLane: {lane} | Time post-treatment: {time_relative} min", fontweight='bold')
+    ax.set_xlabel("Accumulated Lag (Bin Start, minutes)")
+    ax.set_ylabel("Survival Percentage (%)")
+    ax.set_ylim(-5, 105) # Add a little padding below 0 and above 100
+    
+    ax.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.show()
+
+def simulate_population_shift(
+    survival_df: pd.DataFrame,
+    lane: int,
+    time_relative: float,
+    shift_amount: float = 12.0,
+    safeguard: bool = True
+) -> pd.DataFrame:
+    """
+    Simulates shifting the entire population by a specified time amount (modifying their lag)
+    and calculates the expected new number of survivors based on the survival percentage 
+    of the destination bins.
+    
+    Args:
+        survival_df: DataFrame output from `calculate_survival_per_lag_bin`.
+        lane: The specific lane to simulate.
+        time_relative: The relative time post-treatment to simulate.
+        shift_amount: Minutes to shift the population (e.g., +12.0).
+        safeguard: If True, a cohort's expected survival percentage cannot drop below 
+                   what it originally was in its source bin.
+    """
+    if survival_df is None or survival_df.empty:
+        print("Error: Provided DataFrame is empty.")
+        return None
+
+    # Filter for the specific lane and time
+    df_subset = survival_df[(survival_df['lane'] == lane) & 
+                            (survival_df['time_relative'] == time_relative)].copy()
+    
+    if df_subset.empty:
+        print(f"No data found for lane {lane} at time {time_relative}.")
+        return None
+        
+    # Create a lookup dictionary for destination survival rates
+    # Using bin_start as the key
+    survival_lookup = dict(zip(df_subset['bin_start'], df_subset['survival_percentage']))
+    
+    results = []
+    original_total_survivors = 0
+    expected_total_survivors = 0
+    total_population = df_subset['total_cells'].sum()
+    
+    for _, row in df_subset.iterrows():
+        source_bin = row['bin_start']
+        source_pct = row['survival_percentage']
+        cells_moving = row['total_cells']
+        
+        # Where do these cells land?
+        dest_bin = source_bin + shift_amount
+        
+        # What is the historic survival rate of the destination bin?
+        # If the destination bin is beyond our data, assume 0% survival
+        dest_pct = survival_lookup.get(dest_bin, 0.0)
+        
+        # Apply safeguard if requested
+        if safeguard:
+            applied_pct = max(source_pct, dest_pct)
+        else:
+            applied_pct = dest_pct
+            
+        # Calculate expected survivors for this cohort moving to the new bin
+        expected_surv = cells_moving * (applied_pct / 100.0)
+        
+        original_total_survivors += row['survivors']
+        expected_total_survivors += expected_surv
+        
+        results.append({
+            'source_bin': source_bin,
+            'dest_bin': dest_bin,
+            'total_cells_moved': cells_moving,
+            'source_survival_pct': source_pct,
+            'dest_survival_pct': dest_pct,
+            'applied_survival_pct': applied_pct,
+            'expected_survivors': expected_surv
+        })
+        
+    results_df = pd.DataFrame(results)
+    
+    # Calculate overall statistics
+    orig_overall_pct = (original_total_survivors / total_population * 100) if total_population > 0 else 0
+    expected_overall_pct = (expected_total_survivors / total_population * 100) if total_population > 0 else 0
+    
+    print(f"\n{'='*65}")
+    print(f" SIMULATED POPULATION SHIFT: {shift_amount:+} mins")
+    print(f" Lane: {lane} | Time Relative: {time_relative} min")
+    print(f" Safeguard Enabled: {safeguard}")
+    print(f"{'='*65}")
+    print(f"Total Eligible Population (growing_before=True) : {total_population}")
+    print(f"Original Survivors before shift                 : {original_total_survivors} ({orig_overall_pct:.2f}%)")
+    print(f"Expected Survivors after shift                  : {expected_total_survivors:.1f} ({expected_overall_pct:.2f}%)")
+    
+    diff = expected_total_survivors - original_total_survivors
+    print(f"Difference in Survivors                         : {diff:+.1f}")
+    print(f"{'='*65}\n")
+    
+    return results_df
+
+# Napari cell classification
+
+def _maybe_downcast_raw(raw_np):
+    """Downcasts float images to uint16 to save memory and Napari rendering lag."""
+    if raw_np.dtype in (np.float32, np.float64):
+        lo, hi = np.percentile(raw_np, (0.1, 99.9))
+        if hi > lo: 
+            return (np.clip((raw_np - lo) / (hi - lo), 0, 1) * 65535.0).astype(np.uint16)
+    return raw_np
+
+def _load_cell_data(mid, trenches_da, masks_da, frames_to_load, pc_channel, mask_to_uint8):
+    """Worker function to pull raw arrays into memory."""
+    raw_da = trenches_da[mid, :frames_to_load, pc_channel, :, :]
+    mask_da = masks_da[mid, :frames_to_load, 0, :, :]
+    
+    raw_np, mask_np = da.compute(raw_da, mask_da)
+    raw_np = np.ascontiguousarray(_maybe_downcast_raw(raw_np))
+    mask_np = np.ascontiguousarray(mask_np)
+    
+    if mask_to_uint8 and mask_np.dtype != np.uint8: 
+        mask_np = (mask_np != 0).astype(np.uint8, copy=False)
+        
+    return raw_np, mask_np
+
+def _generate_growth_plot(mid, df, treatment_start, treatment_end):
+    """Worker function to pre-render the matplotlib growth plot to an RGBA array."""
+    cell_df = df[df['mother_id'] == mid]
+    fig = plt.Figure(figsize=(8, 2), dpi=100)
+    canvas = FigureCanvas(fig)
+    ax = fig.add_subplot(111)
+    
+    # Support for new data format (time / log_length_smoothed) and old format
+    if not cell_df.empty:
+        if 'time' in cell_df.columns and 'log_length_smoothed' in cell_df.columns:
+            ax.plot(cell_df['time'].values, cell_df['log_length_smoothed'].values, linewidth=1)
+        elif 'time_average' in cell_df.columns and 'log_area' in cell_df.columns:
+            ax.plot(cell_df['time_average'].values, cell_df['log_area'].values, linewidth=1)
+            
+    if treatment_start is not None and treatment_end is not None:
+        ax.axvspan(treatment_start, treatment_end, alpha=0.2, color='red')
+        
+    ax.set(xlabel='Time (min)', ylabel='log(Size)', title=f"ID {mid}")
+    fig.tight_layout(pad=0.3)
+    canvas.draw()
+    
+    buf = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
+    h, w = canvas.get_width_height()[::-1]
+    rgb = buf.reshape((h, w, 4))[..., :3]
+    plt.close(fig)
+    
+    return rgb
+
+def preload_classifier_data(all_ids, processed_ids, trenches_da, masks_da, growing_df, 
+                            frames_to_load, treatment_start, treatment_end, pc_channel=0, mask_to_uint8=True):
+    """Handles threadpool loading of required data arrays."""
+    max_workers = max(4, (os.cpu_count() or 8) - 2)
+    ids_to_load = [mid for mid in all_ids if mid not in processed_ids]
+    
+    if not ids_to_load:
+        return {}
+
+    data_cache = {}
+    print(f"Pre-loading {len(ids_to_load)} new survivor cells into RAM...")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_mid = {
+            executor.submit(_load_cell_data, mid, trenches_da, masks_da, frames_to_load, pc_channel, mask_to_uint8): mid 
+            for mid in ids_to_load
+        }
+        growth_futures = {
+            executor.submit(_generate_growth_plot, mid, growing_df, treatment_start, treatment_end): mid 
+            for mid in ids_to_load
+        }
+        
+        temp_results = {mid: {} for mid in ids_to_load}
+        all_futures = list(future_to_mid.keys()) + list(growth_futures.keys())
+        
+        for future in tqdm(as_completed(all_futures), total=len(all_futures), desc="Loading data & plots"):
+            if future in future_to_mid:
+                temp_results[future_to_mid[future]]['data'] = future.result()
+            else:
+                temp_results[growth_futures[future]]['plot'] = future.result()
+                    
+    for mid, res in temp_results.items():
+        if 'data' in res and 'plot' in res:
+            data_cache[mid] = (*res['data'], res['plot'])
+            
+    return data_cache
+
+def run_cell_classifier(data_cache, all_ids, discard_mother_ids, persister_mother_ids, survivor_mother_ids, 
+                        save_filepath=None, play_interval_ms=10, upscale_xy=(1, 2, 2), 
+                        growth_scale=(0.375, 0.375), bottom_margin_wu=6.0):
+    """Launches the Napari viewer with the preloaded cache."""
+    processed = set(discard_mother_ids) | set(persister_mother_ids) | set(survivor_mother_ids)
+    remaining_ids = [m for m in all_ids if m not in processed]
+    
+    # Helper to print stats when done or closed
+    def print_summary(event=None):
+        total = len(all_ids)
+        n_discard = len(discard_mother_ids)
+        n_persister = len(persister_mother_ids)
+        # Survivor list includes persisters, so we separate them for the printout
+        n_survivor_only = len([x for x in survivor_mother_ids if x not in persister_mother_ids])
+        
+        classified_set = set(discard_mother_ids) | set(survivor_mother_ids) | set(persister_mother_ids)
+        classified = len(classified_set)
+        
+        print("\n" + "-"*30)
+        print("   CLASSIFICATION SUMMARY   ")
+        print("-"*30)
+        print(f"Total Initial Cells    : {total}")
+        print(f"Classified so far      : {classified} / {total}")
+        print(f"  - Discarded          : {n_discard}")
+        print(f"  - Standard Survivors : {n_survivor_only}")
+        print(f"  - Persisters         : {n_persister}")
+        if classified < total:
+            print(f"Remaining to classify  : {total - classified}")
+        print("-"*30 + "\n")
+
+    if not remaining_ids:
+        print("All selected survivors have been classified!")
+        print_summary()
+        return
+
+    viewer = napari.Viewer()
+    
+    # Connect the summary function to the window closing event
+    viewer.events.closing.connect(print_summary)
+    
+    state = {
+        'index': 0, 'image_layer': None, 'mask_layer': None, 'growth_layer': None,
+        'raw_buf': None, 'mask_buf': None, 'growth_buf': None, 'contrast_locked': False
+    }
+    
+    timer = QTimer()
+    timer.setInterval(play_interval_ms)
+    
+    def play_time():
+        try:
+            if state['image_layer'] is not None and state['image_layer'] in viewer.layers:
+                viewer.dims.set_current_step(0, (viewer.dims.current_step[0] + 1) % state['image_layer'].data.shape[0])
+            else:
+                timer.stop()
+        except:
+            timer.stop()
+            
+    timer.timeout.connect(play_time)
+    
+    def _ensure_buffers(raw_data, mask_data, growth_img):
+        if state['raw_buf'] is None:
+            state['raw_buf'] = np.empty_like(raw_data)
+            state['mask_buf'] = np.empty_like(mask_data)
+            state['growth_buf'] = np.empty_like(growth_img)
+            np.copyto(state['raw_buf'], raw_data)
+            np.copyto(state['mask_buf'], mask_data)
+            np.copyto(state['growth_buf'], growth_img)
+            
+            state['image_layer'] = viewer.add_image(state['raw_buf'], name="FOV", interpolation='nearest', scale=upscale_xy)
+            
+            if not state['contrast_locked']:
+                clo, chi = np.percentile(raw_data, (0.5, 99.5))
+                state['image_layer'].contrast_limits = (float(clo), float(chi))
+                state['contrast_locked'] = True
+                
+            state['mask_layer'] = viewer.add_labels(state['mask_buf'], name="Mask", visible=False, opacity=0.5)
+            
+            fy_img, fx_img = raw_data.shape[-2], raw_data.shape[-1]
+            sy_img, sx_img = upscale_xy[1], upscale_xy[2]
+            sy_msk = (fy_img * sy_img) / max(mask_data.shape[-2], 1)
+            sx_msk = (fx_img * sx_img) / max(mask_data.shape[-1], 1)
+            state['mask_layer'].scale = (1, sy_msk, sx_msk)
+            
+            state['growth_layer'] = viewer.add_image(state['growth_buf'], name="Growth", rgb=True, blending='translucent')
+            
+            gh_world, gw_world = growth_img.shape[0] * growth_scale[0], growth_img.shape[1] * growth_scale[1]
+            state['growth_layer'].scale = growth_scale
+            state['growth_layer'].translate = ((fy_img * sy_img) - gh_world - bottom_margin_wu, ((fx_img * sx_img) - gw_world) * 0.5)
+        else:
+            np.copyto(state['raw_buf'], raw_data)
+            np.copyto(state['mask_buf'], mask_data)
+            np.copyto(state['growth_buf'], growth_img)
+            state['image_layer'].refresh(); state['mask_layer'].refresh(); state['growth_layer'].refresh()
+            
+    def load_current():
+        if state['index'] >= len(remaining_ids): return
+        was_active = timer.isActive()
+        if was_active: timer.stop()
+        
+        mid = remaining_ids[state['index']]
+        if mid not in data_cache:
+            print(f"\nWarning: ID {mid} not in cache. Skipping.")
+            advance()
+            return
+            
+        print(f"\rDisplaying mother_id {mid} ({state['index'] + 1}/{len(remaining_ids)})", end="")
+        raw_data, mask_data, growth_img = data_cache[mid]
+        
+        with viewer.layers.events.blocker(), viewer.dims.events.current_step.blocker():
+            _ensure_buffers(raw_data, mask_data, growth_img)
+            viewer.layers.selection.active = state['image_layer']
+            viewer.dims.set_current_step(0, 0)
+            viewer.title = f"({state['index'] + 1}/{len(remaining_ids)}) ID = {mid} | 'd'=Discard | 's'=Survivor | 'p'=Persister | Space=Pause/Resume"
+            
+        if was_active: timer.start()
+        
+    def advance():
+        if save_filepath:
+            save_classification_lists(save_filepath, discard_mother_ids, persister_mother_ids, survivor_mother_ids, verbose=False)
+            
+        state['index'] += 1
+        if state['index'] < len(remaining_ids): 
+            load_current()
+        else: 
+            print("\nAll selected survivors have been classified!")
+            if save_filepath:
+                save_classification_lists(save_filepath, discard_mother_ids, persister_mother_ids, survivor_mother_ids, verbose=True)
+            viewer.close() # This will automatically trigger print_summary() via the event hook
+
+    @viewer.bind_key('Space')
+    def toggle_play(viewer):
+        if timer.isActive(): timer.stop(); print("\nPlayback paused")
+        else: timer.start(); print("\nPlayback resumed")
+            
+    @viewer.bind_key('d')
+    def mark_discard(viewer):
+        mid = remaining_ids[state['index']]
+        if mid not in discard_mother_ids: discard_mother_ids.append(mid)
+        print(f"\nDiscarded: {mid}"); advance()
+        
+    @viewer.bind_key('p')
+    def mark_persister(viewer):
+        mid = remaining_ids[state['index']]
+        if mid not in persister_mother_ids: persister_mother_ids.append(mid)
+        if mid not in survivor_mother_ids: survivor_mother_ids.append(mid) 
+        print(f"\nPersister (& Survivor): {mid}"); advance()
+        
+    @viewer.bind_key('s')
+    def mark_survivor(viewer):
+        mid = remaining_ids[state['index']]
+        if mid not in survivor_mother_ids: survivor_mother_ids.append(mid)
+        print(f"\nSurvivor: {mid}"); advance()
+        
+    load_current()
+    timer.start()
+    
+    print(f"\nNapari window loaded. Progress will auto-save.")
+    napari.run()
+
+def start_classification_session(
+    mother_machine_data: pd.DataFrame, 
+    treatment_start: float, 
+    treatment_end: float,
+    config: dict,
+    discard_list: list, 
+    persister_list: list, 
+    survivor_list: list, 
+    cache_dict: dict,
+    save_filepath: str = "classification_results.json",
+    trenches_file: str = "trenches.zarr",
+    masks_file: str = "masks_upscaled_filtered.zarr",
+    include_lanes: list = [0, 1, 2, 3],
+    max_t_for_review: int = None,
+    auto_load: bool = True
+):
+    """Master function to prepare data and launch Napari."""
+    print("Initializing classification session...")
+
+    if auto_load and os.path.exists(save_filepath):
+        total_in_memory = len(discard_list) + len(persister_list) + len(survivor_list)
+        if total_in_memory == 0:
+            print(f"Loading previous session data from {save_filepath}...")
+            with open(save_filepath, 'r') as f:
+                data = json.load(f)
+                discard_list.extend(data.get("discard_mother_ids", []))
+                persister_list.extend(data.get("persister_mother_ids", []))
+                survivor_list.extend(data.get("survivor_mother_ids", []))
+        else:
+            print(f"Resuming active session. Found {total_in_memory} classified cells in memory.")
+            
+    dask.config.set({
+        "array.slicing.split_large_chunks": True, 
+        "optimization.fuse.active": True, 
+        "scheduler": "threads"
+    })
+
+    # Retrieve PC channel dynamically from the config dictionary
+    pc_channel = config.get("PC_channel", config.get("pc_channel", 0))
+
+    trenches_da = da.from_zarr(zarr.open_array(trenches_file, mode="r"))
+    masks_da = da.from_zarr(zarr.open_array(masks_file, mode="r"))
+
+    try: 
+        frames_to_load = int(mother_machine_data["timepoint"].max())
+    except Exception: 
+        frames_to_load = int(trenches_da.shape[1])
+        
+    frames_to_load = int(min(frames_to_load, trenches_da.shape[1]))
+    if max_t_for_review is not None: 
+        frames_to_load = min(frames_to_load, int(max_t_for_review))
+
+    # Strict check to ensure both growth flags exist and are True
+    if "growing_before" not in mother_machine_data.columns or "growing_after" not in mother_machine_data.columns:
+        raise ValueError("mother_machine_data is missing 'growing_before' or 'growing_after' columns.")
+
+    df_filtered = mother_machine_data[
+        (mother_machine_data['lane'].isin(include_lanes)) &
+        (mother_machine_data['growing_before'] == True) &
+        (mother_machine_data['growing_after'] == True)
+    ].copy()
+
+    all_ids = sorted(df_filtered['mother_id'].unique())
+
+    if not all_ids:
+        print("Error: No surviving cells found matching the criteria in the specified lanes.")
+        return
+
+    processed_ids = set(discard_list) | set(persister_list) | set(survivor_list)
+    ids_to_skip_loading = processed_ids.union(cache_dict.keys())
+
+    new_data = preload_classifier_data(
+        all_ids=all_ids,
+        processed_ids=ids_to_skip_loading,
+        trenches_da=trenches_da,
+        masks_da=masks_da,
+        growing_df=df_filtered,
+        frames_to_load=frames_to_load,
+        treatment_start=treatment_start,
+        treatment_end=treatment_end,
+        pc_channel=pc_channel
+    )
+    
+    cache_dict.update(new_data)
+    for pid in processed_ids:
+        cache_dict.pop(pid, None)
+
+    run_cell_classifier(
+        data_cache=cache_dict,
+        all_ids=all_ids,
+        discard_mother_ids=discard_list,
+        persister_mother_ids=persister_list,
+        survivor_mother_ids=survivor_list,
+        save_filepath=save_filepath
+    )
+
+def save_classification_lists(filepath: str, discard_list: list, persister_list: list, survivor_list: list, verbose: bool = True):
+    """Saves the current state of classification lists to a JSON file."""
+    data = {
+        "discard_mother_ids": [int(x) for x in discard_list],
+        "persister_mother_ids": [int(x) for x in persister_list],
+        "survivor_mother_ids": [int(x) for x in survivor_list]
+    }
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=4)
+    if verbose:
+        print(f"\nProgress saved to: {filepath}")
