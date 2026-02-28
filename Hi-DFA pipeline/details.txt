@@ -1,0 +1,3 @@
+Omnipose segmentation (step 3) requires its own environment with packages in the environment.yml file
+
+All other steps can use the same environment (another environment.yml file in the other folder)
