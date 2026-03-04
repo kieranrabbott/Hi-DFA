@@ -15,6 +15,8 @@ from .objective import (
     _observed_matrix,
     _pack_params,
     _pred_matrix,
+    _regime_dominance_penalty,
+    _survivor_composition_nll,
     _tolerance_penalty,
     _unpack_params,
     make_objective,
@@ -37,9 +39,12 @@ def build_objectives(
     kappa=5000.0,
     lam_pen=1e-2,
     lam_hill_constraint=1e6,
+    lam_regime=0.0,
     rho=0.8,
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
+    kappa_surv=500.0,
+    lam_surv=1.0,
 ):
     P_obs = _observed_matrix(data)
     ages_for_constraint = tuple(sorted({float(row[3]) for row in data}))
@@ -53,7 +58,9 @@ def build_objectives(
         p = unpack(z)
         model = STDPModel(p)
         P_pred = _pred_matrix(model, data)
-        return _nll_dirichlet(P_obs, P_pred, kappa=kappa, class_weights=class_weights)
+        base_nll = _nll_dirichlet(P_obs, P_pred, kappa=kappa, class_weights=class_weights)
+        surv_nll = _survivor_composition_nll(model, data, kappa_surv=kappa_surv)
+        return base_nll + lam_surv * surv_nll
 
     def pen_only(z):
         p = unpack(z)
@@ -67,8 +74,16 @@ def build_objectives(
             weight=lam_hill_constraint,
         )
 
+    def regime_only(z):
+        p = unpack(z)
+        return _regime_dominance_penalty(
+            p,
+            ages=ages_for_constraint,
+            weight=lam_regime,
+        )
+
     def total(z):
-        return nll_only(z) + lam_pen * pen_only(z) + hill_constraint_only(z)
+        return nll_only(z) + lam_pen * pen_only(z) + hill_constraint_only(z) + regime_only(z)
 
     return total, nll_only, pen_only, unpack
 
@@ -160,9 +175,12 @@ def draw_laplace_samples(
     kappa: float = 5000.0,
     lam_pen: float = 1e-2,
     lam_hill_constraint: float = 1e6,
+    lam_regime: float = 0.0,
     rho: float = 0.8,
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
+    kappa_surv: float = 500.0,
+    lam_surv: float = 1.0,
 ):
     cfg = config or UncertaintyConfig()
 
@@ -173,9 +191,12 @@ def draw_laplace_samples(
         kappa=kappa,
         lam_pen=lam_pen,
         lam_hill_constraint=lam_hill_constraint,
+        lam_regime=lam_regime,
         rho=rho,
         ages_for_pen=ages_for_pen,
         class_weights=class_weights,
+        kappa_surv=kappa_surv,
+        lam_surv=lam_surv,
     )
 
     x_hat = _pack_params(best_params, list(free_keys))

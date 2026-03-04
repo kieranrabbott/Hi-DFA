@@ -182,7 +182,7 @@ def plot_fraction_comparison(
 
     diag_lo = min(xlim[0], ylim[0]) if use_log else 0.0
     diag_hi = max(xlim[1], ylim[1])
-    ax.plot([diag_lo, diag_hi], [diag_lo, diag_hi], "k--", lw=1.5, zorder=0)
+    ax.plot([diag_lo, diag_hi], [diag_lo, diag_hi], "k--", lw=0.2 / 0.3528, alpha=0.3, zorder=0)
 
     if use_log:
         ax.set_xscale("log")

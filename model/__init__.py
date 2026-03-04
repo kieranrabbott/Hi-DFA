@@ -11,7 +11,7 @@ from .data import (
 )
 from .fit import FitConfig, FitResult, KLagSearchResult, compute_class_weights, fit_over_k_lag, fit_stdp
 from .notebook import ModelWorkflow, WorkflowConfig
-from .objective import DEFAULT_FREE_KEYS, NUM_BOUNDS, make_objective
+from .objective import DEFAULT_FREE_KEYS, NUM_BOUNDS, effective_lag_rate, make_objective
 from .plotting_advanced import (
     J_discounted,
     composition_vs_age,
@@ -44,6 +44,7 @@ __all__ = [
     "dataset_to_dataframe",
     "DEFAULT_FREE_KEYS",
     "NUM_BOUNDS",
+    "effective_lag_rate",
     "make_objective",
     "FitConfig",
     "FitResult",
