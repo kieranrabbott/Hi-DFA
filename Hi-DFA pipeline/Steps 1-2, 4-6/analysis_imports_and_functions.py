@@ -10237,8 +10237,8 @@ def run_cell_classifier(data_cache, all_ids, discard_mother_ids, persister_mothe
         print(f"Total Initial Cells    : {total}")
         print(f"Classified so far      : {classified} / {total}")
         print(f"  - Discarded          : {n_discard}")
-        print(f"  - Standard Survivors : {n_survivor_only}")
         print(f"  - Persisters         : {n_persister}")
+        print(f"  - Other Survivors : {n_survivor_only}")
         if classified < total:
             print(f"Remaining to classify  : {total - classified}")
         print("-"*30 + "\n")
@@ -10479,3 +10479,210 @@ def save_classification_lists(filepath: str, discard_list: list, persister_list:
         json.dump(data, f, indent=4)
     if verbose:
         print(f"\nProgress saved to: {filepath}")
+
+def classify_and_summarize_cell_populations(
+    mother_machine_data: pd.DataFrame,
+    treatment_start: float,
+    treatment_end: float,
+    discard_mother_ids: List[Any],
+    persister_mother_ids: List[Any],
+    survivor_mother_ids: List[Any],
+    min_lost_time: float = 10.0,
+    require_growing_before: bool = True,
+    calc_bootstrap_ci: bool = True,
+    bootstrap_n: int = 10000
+) -> Optional[pd.DataFrame]:
+    """
+    Categorizes cells into 4 classes ('susceptible', 'persister', 'exp_limited', 
+    'transient_tol') and calculates the percentage of the initial population per lane.
+    Handles unreviewed lanes by defaulting growing_after=True to survivor classes.
+    """
+    if mother_machine_data is None or mother_machine_data.empty:
+        print("Skipping Classification Analysis: DataFrame is empty or not loaded.")
+        return None
+        
+    required_cols = ['current_lost_time', 'slowdown_start', 'growing_after']
+    required_cols.append('growing_before' if require_growing_before else 'at_start')
+    
+    missing = [c for c in required_cols if c not in mother_machine_data.columns]
+    if missing:
+        print(f"Error: Required columns missing: {missing}")
+        return None
+
+    # Handle potentially None lists safely
+    discard_mother_ids = set(discard_mother_ids or [])
+    persister_mother_ids = set(persister_mother_ids or [])
+    survivor_mother_ids = set(survivor_mother_ids or [])
+
+    # =========================================================================
+    # 1. Annotate cell_class safely (avoid FutureWarning)
+    # =========================================================================
+    if 'cell_class' not in mother_machine_data.columns:
+        mother_machine_data['cell_class'] = np.nan
+    mother_machine_data['cell_class'] = mother_machine_data['cell_class'].astype(object)
+    
+    # Base Population Definition
+    if require_growing_before:
+        starting_moms = set(mother_machine_data.loc[mother_machine_data['growing_before'] == True, 'mother_id'])
+    else:
+        starting_moms = set(mother_machine_data.loc[mother_machine_data['at_start'] == True, 'mother_id'])
+        
+    valid_moms = starting_moms - discard_mother_ids
+    
+    # Identify Active Slowdowns strictly inside window
+    window_mask = (mother_machine_data['time'] >= treatment_start) & \
+                  (mother_machine_data['time'] <= treatment_end) & \
+                  (mother_machine_data['slowdown'] == True)
+    window_df = mother_machine_data[window_mask]
+    
+    passed_moms = set()
+    if not window_df.empty:
+        event_deltas = window_df.groupby(['mother_id', 'slowdown_start'])['current_lost_time'].agg(
+            lambda x: x.max() - x.min()
+        ).reset_index(name='lost_time_in_window')
+        mother_totals = event_deltas.groupby('mother_id')['lost_time_in_window'].sum().reset_index()
+        passed_moms = set(mother_totals[mother_totals['lost_time_in_window'] >= min_lost_time]['mother_id'])
+
+    # --- Classification Logic ---
+    growing_after_moms = set(mother_machine_data.loc[mother_machine_data['growing_after'] == True, 'mother_id'])
+    
+    # Implicit survivors: grew after treatment, not in explicit lists
+    implicit_survivor_moms = (valid_moms & growing_after_moms) - survivor_mother_ids - persister_mother_ids
+    
+    # Compile final sets
+    all_survivors = (survivor_mother_ids | implicit_survivor_moms) & valid_moms
+    all_persisters = persister_mother_ids & valid_moms
+    
+    transient_tol_moms = all_survivors & passed_moms
+    exp_limited_moms = all_survivors - transient_tol_moms
+    susceptible_moms = valid_moms - all_survivors - all_persisters
+
+    # Create master mask for valid assignment
+    is_valid_base = mother_machine_data['mother_id'].isin(valid_moms)
+    
+    mother_machine_data.loc[is_valid_base & mother_machine_data['mother_id'].isin(susceptible_moms), 'cell_class'] = 'susceptible'
+    mother_machine_data.loc[is_valid_base & mother_machine_data['mother_id'].isin(all_persisters), 'cell_class'] = 'persister'
+    mother_machine_data.loc[is_valid_base & mother_machine_data['mother_id'].isin(exp_limited_moms), 'cell_class'] = 'exp_limited'
+    mother_machine_data.loc[is_valid_base & mother_machine_data['mother_id'].isin(transient_tol_moms), 'cell_class'] = 'transient_tol'
+
+    # =========================================================================
+    # 2. Aggregate Data into cell_classes_df
+    # =========================================================================
+    lane_cols = ['lane_num', 'lane', 'lane_id', 'lane_ID', 'position', 'pos']
+    lane_col = next((c for c in lane_cols if c in mother_machine_data.columns), None)
+    cond_col = next((c for c in ['condition', 'Condition'] if c in mother_machine_data.columns), None)
+    
+    group_cols = [lane_col]
+    if cond_col: group_cols.append(cond_col)
+
+    unique_moms = mother_machine_data.drop_duplicates('mother_id')
+    base_moms = unique_moms[unique_moms['mother_id'].isin(valid_moms)]
+    lane_conds = base_moms[group_cols].drop_duplicates()
+    
+    classes = ['susceptible', 'persister', 'exp_limited', 'transient_tol']
+    rows = []
+    
+    for _, lc in lane_conds.iterrows():
+        mask = (base_moms[lane_col] == lc[lane_col])
+        if cond_col: mask &= (base_moms[cond_col] == lc[cond_col])
+            
+        lane_group = base_moms[mask]
+        initial_cells = len(lane_group)
+        
+        for c in classes:
+            n = len(lane_group[lane_group['cell_class'] == c])
+            row_data = {
+                lane_col: lc[lane_col],
+                'initial_cells': initial_cells,
+                'cell_class': c,
+                'n': n,
+                'pct_of_initial': (n / initial_cells * 100.0) if initial_cells > 0 else 0.0
+            }
+            if cond_col: row_data[cond_col] = lc[cond_col]
+            rows.append(row_data)
+            
+    stats = pd.DataFrame(rows)
+    col_order = group_cols + ['initial_cells', 'cell_class', 'n', 'pct_of_initial']
+    stats = stats[col_order]
+
+    # =========================================================================
+    # 3. Bootstrapping Mean and 95% CI
+    # =========================================================================
+    if calc_bootstrap_ci:
+        means, ci_lows, ci_highs = [], [], []
+        
+        for _, row in stats.iterrows():
+            total = int(row['initial_cells'])
+            n = int(row['n'])
+            
+            if total == 0:
+                means.append(0.0); ci_lows.append(0.0); ci_highs.append(0.0)
+                continue
+                
+            pop_array = np.array([1] * n + [0] * (total - n))
+            resamples = np.random.choice(pop_array, size=(bootstrap_n, total), replace=True)
+            resampled_pcts = resamples.mean(axis=1) * 100.0
+            
+            means.append(np.mean(resampled_pcts))
+            ci_lows.append(np.percentile(resampled_pcts, 2.5))
+            ci_highs.append(np.percentile(resampled_pcts, 97.5))
+            
+        stats['mean'] = means
+        stats['ci_low'] = ci_lows
+        stats['ci_high'] = ci_highs
+
+    # Generate the 'summary' string column (2 d.p. + round brackets)
+    summary_list = []
+    for _, row in stats.iterrows():
+        if calc_bootstrap_ci:
+            summary_list.append(f"{row['mean']:>5.2f}% ({row['ci_low']:>5.2f}%, {row['ci_high']:>5.2f}%)")
+        else:
+            summary_list.append(f"{row['pct_of_initial']:.2f}%")
+    stats['summary'] = summary_list
+
+    # =========================================================================
+    # 4. Old-Style Print Output
+    # =========================================================================
+    cond_width = max(stats[cond_col].astype(str).map(len).max(), 28) if cond_col else 9
+    
+    header = f"{'Lane':<5} | "
+    if cond_col: header += f"{'Condition':<{cond_width}} | "
+    header += f"{'Init Pop':<8} | {'Survivors':<9} || {'Slow N':<6} | {'Slow %Init (Mean ± 95% CI)':<30} || {'NoSlow N':<8} | {'NoSlow %Init (Mean ± 95% CI)'}"
+    
+    print("\n" + header)
+    print("-" * len(header))
+    
+    for _, lc in lane_conds.iterrows():
+        lane_str = str(lc[lane_col])
+        cond_str = f"{lc[cond_col]:<{cond_width}} | " if cond_col else ""
+        
+        # Get stats rows for this lane
+        lane_mask = (stats[lane_col] == lc[lane_col])
+        if cond_col: lane_mask &= (stats[cond_col] == lc[cond_col])
+        l_stats = stats[lane_mask]
+        
+        init = l_stats['initial_cells'].iloc[0] if not l_stats.empty else 0
+        
+        slow_row = l_stats[l_stats['cell_class'] == 'transient_tol']
+        noslow_row = l_stats[l_stats['cell_class'] == 'exp_limited']
+        
+        slow_n = slow_row['n'].iloc[0] if not slow_row.empty else 0
+        noslow_n = noslow_row['n'].iloc[0] if not noslow_row.empty else 0
+        survivors = slow_n + noslow_n
+        
+        slow_ci = slow_row['summary'].iloc[0].strip() if not slow_row.empty else "0.00%"
+        noslow_ci = noslow_row['summary'].iloc[0].strip() if not noslow_row.empty else "0.00%"
+        
+        if calc_bootstrap_ci:
+            if not slow_row.empty:
+                slow_ci = f"{slow_row['mean'].iloc[0]:>5.1f}% [{slow_row['ci_low'].iloc[0]:>4.1f}%, {slow_row['ci_high'].iloc[0]:>4.1f}%]"
+            if not noslow_row.empty:
+                noslow_ci = f"{noslow_row['mean'].iloc[0]:>5.1f}% [{noslow_row['ci_low'].iloc[0]:>4.1f}%, {noslow_row['ci_high'].iloc[0]:>4.1f}%]"
+                
+        print(f"{lane_str:<5} | {cond_str}{init:<8} | {survivors:<9} || {slow_n:<6} | {slow_ci:<30} || {noslow_n:<8} | {noslow_ci}")
+        
+    print("-" * len(header))
+    
+    return stats
+
+# end
