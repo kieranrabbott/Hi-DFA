@@ -5,30 +5,54 @@ from typing import Callable, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
-from .core import STDPModel, STDPParams, get_hill_hazard_flags, hS, hT
+from .core import STDPModel, STDPParams, get_hill_hazard_flags, hS, hT, rST
 
 
 EPS_LOG_LOWER = 1e-8
 
+
+def effective_lag_rate(p: STDPParams, a: float) -> float:
+    """Effective lag rate accounting for the hybrid Erlang + Exp mixture.
+
+    The mean lag time is  E[L] = w · μ_Erlang(a) + (1−w) / λ_slow ,
+    and the effective rate is 1 / E[L].
+
+    When ``w_lag ≈ 0`` the Erlang component is negligible and the effective
+    rate collapses to ``lam_slow``, *not* the Erlang rate ``k_lag / μ(a)``.
+    This distinction matters for the regime-dominance and Hill-lambda
+    constraint penalties.
+    """
+    model = STDPModel(p)
+    mu_erlang = model.mean_lag(a)
+    lam_s = model.slow_rate(a)
+    mean_lag = p.w_lag * mu_erlang + (1.0 - p.w_lag) / max(lam_s, 1e-9)
+    return 1.0 / max(mean_lag, 1e-9)
+
 NUM_BOUNDS = {
-    "mu0": (0.03, 40.0),
-    "mu24p": (0.0, 40.0),
+    "w_lag": (0, 1),
+    "lam_slow": (1e-6, 10.0),
+    "mu0": (0.03, 400.0),
+    "mu24p": (0.0, 400.0),
     "kS_kT_ratio": (1.0, 1000.0),
     "kT": (1e-4, 100.0),
-    "kST": (1e-3, 100.0),
-    "K": (1e-6, 1e6),
+    "kST": (1e-3, 1000.0),
+    "K": (1e-6, 1e3),
     "KST": (1e-6, 1e6),
-    "n": (0.0, 40.5),
-    "nST": (0.0, 40.5),
-    "a50": (10.0, 300000.0),
+    "n": (0.0, 4.5),
+    "nST": (0.0, 4.5),
+    "a50": (0.0, 300000.0),
     "r0": (0.0, 1.0),
-    "nS": (0.0, 40.5),
-    "nT": (0.0, 40.5),
-    "KS": (1e-6, 1e6),
-    "KT": (1e-6, 1e6),
+    "nS": (0.0, 4.5),
+    "nT": (0.0, 4.5),
+    "KS": (1e-6, 1e3),
+    "KT": (1e-6, 1e3),
+    "mu_s0": (0.1, 1e6),
+    "mu_s24p": (1e-6, 50000.0),
 }
 
 DEFAULT_FREE_KEYS = [
+    "w_lag",
+    "lam_slow",
     "mu0",
     "mu24p",
     "kS_kT_ratio",
@@ -99,6 +123,56 @@ def _nll_dirichlet(
     return -float(ll)
 
 
+def _survivor_composition_nll(
+    model: STDPModel,
+    data,
+    kappa_surv: float = 500.0,
+    eps: float = 1e-12,
+) -> float:
+    """Dirichlet NLL on the renormalised survivor composition (S, T, D).
+
+    The standard four-class Dirichlet NLL is dominated by the *dead* class
+    at high antibiotic concentrations (often >99 % dead), so the model
+    receives almost no gradient signal about *which* state the survivors
+    belong to.  This auxiliary NLL renormalises observed and predicted
+    fractions to (S, T, D) only, weighting the composition equally across
+    all concentrations regardless of total survival rate.
+    """
+    total_nll = 0.0
+
+    for _, C, tau, a, fr in data:
+        obs_s = float(fr["incomplete"])
+        obs_t = float(fr["induced"])
+        obs_d = float(fr["preexisting"])
+        obs_total = obs_s + obs_t + obs_d
+
+        if obs_total < eps:
+            continue
+
+        phi_obs = np.array([obs_s, obs_t, obs_d]) / obs_total
+        phi_obs = np.clip(phi_obs, eps, 1.0 - eps)
+        phi_obs = phi_obs / phi_obs.sum()
+
+        pr = model.predict_condition(C, tau, a)
+        pred_s = max(float(pr.incomplete), 0.0)
+        pred_t = max(float(pr.induced), 0.0)
+        pred_d = max(float(pr.preexisting), 0.0)
+        pred_total = pred_s + pred_t + pred_d
+
+        if pred_total < eps:
+            total_nll += kappa_surv * 10.0
+            continue
+
+        phi_pred = np.array([pred_s, pred_t, pred_d]) / pred_total
+        phi_pred = np.clip(phi_pred, eps, 1.0 - eps)
+        phi_pred = phi_pred / phi_pred.sum()
+
+        alpha = kappa_surv * phi_obs
+        total_nll -= float(np.sum((alpha - 1.0) * np.log(phi_pred)))
+
+    return float(total_nll)
+
+
 def _tolerance_penalty(
     p: STDPParams,
     rho: float = 0.8,
@@ -135,9 +209,11 @@ def _hill_lambda_constraint_penalty(
     weight: float = 1e6,
 ) -> float:
     """
-    Enforce lambda(age) <= hT_inf under Hill hT kinetics.
+    Enforce effective_lag_rate(age) <= hT_inf under Hill hT kinetics.
 
     For hT(C) = kT * C^n / (K^n + C^n), hT_inf = kT.
+    Uses :func:`effective_lag_rate` (accounts for the Erlang/Exponential
+    mixture weight ``w_lag``) instead of the bare Erlang rate.
     """
     if weight <= 0:
         return 0.0
@@ -146,18 +222,81 @@ def _hill_lambda_constraint_penalty(
     if not hill_flags["hT_effective"]:
         return 0.0
 
-    model = STDPModel(p)
     ht_inf = float(p.kT)
     max_violation = 0.0
 
     for age in ages:
-        lam = model.lam_from_mean(float(age))
+        lam = effective_lag_rate(p, float(age))
         max_violation = max(max_violation, lam - ht_inf)
 
     if max_violation <= 0.0:
         return 0.0
 
     return float(weight * (max_violation**2))
+
+
+def _regime_dominance_penalty(
+    p: STDPParams,
+    ages: Tuple[float, ...],
+    min_kT_over_lam: float = 2.0,
+    k_soft: float = 20.0,
+    weight: float = 1e4,
+    **_kwargs,
+) -> float:
+    """
+    Penalise kT / λ_eff(a) < min_kT_over_lam.
+
+    At saturating C, hT → kT. The Regime IV boundary is hT ≥ 2λ + g,
+    above which permanent T-over-D dominance is impossible (SI §S6.3).
+    With min_kT_over_lam = 2.0 (default), this targets the Regime IV
+    boundary (ignoring g, which is conservative).
+
+    Uses :func:`effective_lag_rate` (accounts for the Erlang/Exponential
+    mixture weight ``w_lag``) instead of the bare Erlang rate.
+
+    Uses softplus(x) = log(1 + exp(k_soft * x)) / k_soft for smooth
+    L-BFGS-B gradients.
+    """
+    if weight <= 0:
+        return 0.0
+
+    hill_flags = get_hill_hazard_flags()
+    if not hill_flags["hT_effective"]:
+        return 0.0
+
+    ht_inf = float(p.kT)  # Hill saturation limit
+
+    total = 0.0
+    for a in ages:
+        lam = effective_lag_rate(p, float(a))
+        violation = min_kT_over_lam - (ht_inf / max(lam, 1e-9))
+        total += np.log1p(np.exp(k_soft * violation)) / k_soft
+
+    return float(weight * total / max(len(ages), 1))
+
+
+def _param_regularization_penalty(
+    p: STDPParams,
+    n_max: float = 10.0,
+    nST_max: float = 10.0,
+    r0_max: float = 0.5,
+    ratio_min: float = 1.5,
+    k_soft: float = 5.0,
+) -> float:
+    """
+    Penalise biologically implausible parameter values.
+
+    Uses softplus(x) = log(1 + exp(k*x)) / k for smooth L-BFGS-B gradients.
+    """
+    total = 0.0
+    # Extreme Hill exponents → near-step-function dose-response
+    total += np.log1p(np.exp(k_soft * (p.n - n_max))) / k_soft
+    total += np.log1p(np.exp(k_soft * (p.nST - nST_max))) / k_soft
+    # Baseline switching should be small (spontaneous, no drug stress)
+    total += np.log1p(np.exp(k_soft * (p.r0 - r0_max))) / k_soft
+    # S death rate should exceed T death rate meaningfully
+    total += np.log1p(np.exp(k_soft * (ratio_min - p.kS_kT_ratio))) / k_soft
+    return float(total)
 
 
 def _pack_params(p: STDPParams, free_keys: List[str]) -> np.ndarray:
@@ -203,6 +342,10 @@ def make_objective(
     ages_for_pen: Tuple[float, ...] = (24.0, 48.0, 72.0),
     class_weights=None,
     lam_hill_constraint: float = 1e6,
+    lam_regime: float = 0.0,
+    lam_reg: float = 1e3,
+    kappa_surv: float = 500.0,
+    lam_surv: float = 1.0,
 ):
     free_keys = DEFAULT_FREE_KEYS if free_keys is None else list(free_keys)
     P_obs = _observed_matrix(data)
@@ -215,12 +358,22 @@ def make_objective(
         model = STDPModel(cand)
         P_pred = _pred_matrix(model, data)
         nll = _nll_dirichlet(P_obs, P_pred, kappa=kappa, class_weights=class_weights)
+        surv_nll = _survivor_composition_nll(model, data, kappa_surv=kappa_surv)
         pen = _tolerance_penalty(cand, rho=rho, ages=ages_for_pen)
         hill_pen = _hill_lambda_constraint_penalty(
             cand,
             ages=ages_for_constraint,
             weight=lam_hill_constraint,
         )
-        return float(nll + lam_pen * pen + hill_pen)
+        regime_pen = _regime_dominance_penalty(
+            cand,
+            ages=ages_for_constraint,
+            weight=lam_regime,
+        )
+        reg_pen = _param_regularization_penalty(cand)
+        return float(
+            nll + lam_surv * surv_nll + lam_pen * pen
+            + hill_pen + regime_pen + lam_reg * reg_pen
+        )
 
     return objective, free_keys

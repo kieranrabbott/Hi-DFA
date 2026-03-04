@@ -4,9 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import PowerNorm
-from scipy import special as sps
-
-from .core import STDPModel
+from .core import STDPModel, _erlang_sf
 
 
 DEFAULT_COLORS = {
@@ -41,7 +39,7 @@ def composition_vs_tau(model, C: float, a: float, tau_grid=None, figsize=(1.3, 1
         np.asarray(induced),
         np.asarray(preexist),
         np.asarray(dead),
-        labels=["Incomplete", "Induced tolerant", "Pre-existing persister", "Dead"],
+        labels=["Exposure limited", "Transient tolerant", "Persister", "Dead"],
         colors=[
             DEFAULT_COLORS["incomplete"],
             DEFAULT_COLORS["induced"],
@@ -50,7 +48,7 @@ def composition_vs_tau(model, C: float, a: float, tau_grid=None, figsize=(1.3, 1
         ],
         alpha=0.85,
     )
-    ax.set_xlabel("Exposure duration τ (h)")
+    ax.set_xlabel("Treatment duration: τ (h)")
     ax.set_ylabel("Frac of population at Ab removal")
     ax.set_xlim(tau_grid.min(), tau_grid.max())
     ax.set_yscale("log")
@@ -84,7 +82,7 @@ def composition_vs_concentration(
         np.asarray(induced),
         np.asarray(preexist),
         np.asarray(dead),
-        labels=["Incomplete", "Induced tolerant", "Pre-existing persister", "Dead"],
+        labels=["Exposure limited", "Transient tolerant", "Persister", "Dead"],
         colors=[
             DEFAULT_COLORS["incomplete"],
             DEFAULT_COLORS["induced"],
@@ -94,7 +92,7 @@ def composition_vs_concentration(
         alpha=0.85,
     )
     ax.set_xscale("log")
-    ax.set_xlabel("Antibiotic concentration C (μg/mL)")
+    ax.set_xlabel("Antibiotic conc: C (μg/mL)")
     ax.set_ylabel("Frac of population at Ab removal")
     ax.set_xlim(C_grid.min(), C_grid.max())
     ax.set_yscale("log")
@@ -126,7 +124,7 @@ def composition_vs_age(model, C: float, tau: float, a_grid=None, figsize=(1.3, 1
         np.asarray(induced),
         np.asarray(preexist),
         np.asarray(dead),
-        labels=["Incomplete", "Induced tolerant", "Pre-existing persister", "Dead"],
+        labels=["Exposure limited", "Transient tolerant", "Persister", "Dead"],
         colors=[
             DEFAULT_COLORS["incomplete"],
             DEFAULT_COLORS["induced"],
@@ -135,7 +133,7 @@ def composition_vs_age(model, C: float, tau: float, a_grid=None, figsize=(1.3, 1
         ],
         alpha=0.85,
     )
-    ax.set_xlabel("Dormancy depth a (h)")
+    ax.set_xlabel("Culture age: a (h)")
     ax.set_ylabel("Frac of population at Ab removal")
     ax.set_xlim(a_grid.min(), a_grid.max())
     ax.set_yscale("log")
@@ -164,11 +162,6 @@ def grid_survivor_composition(model, C_grid, tau_grid, a, eps=1e-12):
     phi_S = S / denom
     phi_T = T / denom
     phi_D = D / denom
-
-    mask0 = surv <= eps
-    phi_S[mask0] = 0.0
-    phi_T[mask0] = 0.0
-    phi_D[mask0] = 0.0
 
     return phi_S, phi_T, phi_D, surv
 
@@ -353,12 +346,37 @@ def draw_survivor_brightness_bar(
     return fig, ax
 
 
-def J_discounted(u, tau, k, lam, g):
-    alpha = lam + g
-    pref = (lam / alpha) ** k * np.exp(g * tau)
-    P_b = sps.gammainc(k, alpha * (tau + u))
-    P_a = sps.gammainc(k, alpha * tau)
-    return float(pref * (P_b - P_a))
+def _regularized_gamma_P(k: int, x: float) -> float:
+    """Regularized lower incomplete gamma P(k, x) = 1 - _erlang_sf(k, 1, x)."""
+    return 1.0 - _erlang_sf(k, 1.0, x)
+
+
+def J_discounted(u, tau, w, k, lam, lam_s, g):
+    """
+    J_g(u) for hybrid Erlang + Exponential lag: regrown mass from cells still
+    dormant at tau that wake and grow during post-treatment interval [0, u].
+
+    Erlang component:
+      w * (lam/(lam+g))^k * exp(g*tau) * [P(k,(lam+g)*(tau+u)) - P(k,(lam+g)*tau)]
+
+    Exponential component:
+      (1-w) * lam_s * exp(-lam_s*tau) * [1 - exp(-(g+lam_s)*u)] / (g+lam_s)
+    """
+    # Erlang component
+    alpha_e = lam + g
+    ratio = lam / alpha_e
+    scale = w * (ratio ** k) * float(np.exp(g * tau))
+    P_upper = _regularized_gamma_P(k, alpha_e * (tau + u))
+    P_lower = _regularized_gamma_P(k, alpha_e * tau)
+    J_erlang = scale * (P_upper - P_lower)
+
+    # Exponential component
+    alpha_s = g + lam_s
+    J_exp = (1.0 - w) * lam_s * float(np.exp(-lam_s * tau)) * (
+        1.0 - float(np.exp(-alpha_s * u))
+    ) / alpha_s
+
+    return float(J_erlang + J_exp)
 
 
 def descendant_shares(model: STDPModel, C: float, tau: float, a: float, u: float, g: float):
@@ -366,15 +384,20 @@ def descendant_shares(model: STDPModel, C: float, tau: float, a: float, u: float
     pi_S = float(pr.incomplete)
     pi_T = float(pr.induced)
 
-    lam = model.lam_from_mean(a)
+    lam = model.erlang_rate(a)
+    w = model.p.w_lag
     k = model.p.k_lag
-    J = J_discounted(u, tau, k, lam, g)
+    lam_s = model.slow_rate(a)
+    J = J_discounted(u, tau, w, k, lam, lam_s, g)
 
-    denom = max(pi_S + pi_T + J, 1e-12)
-    w_S = pi_S / denom
-    w_T = pi_T / denom
-    w_D = J / denom
-    R_u = np.exp(g * u) * denom
+    total = pi_S + pi_T + J
+    if total > 0.0:
+        w_S = pi_S / total
+        w_T = pi_T / total
+        w_D = J / total
+    else:
+        w_S = w_T = w_D = 1.0 / 3.0
+    R_u = np.exp(g * u) * total
 
     return w_S, w_T, w_D, R_u
 
@@ -408,9 +431,14 @@ def show_heatmap_with_keys_labeled(
     k_gamma=1.0,
     title_heatmap=None,
     bar_label="brightness",
+    figsize=(4.0, 1.8),
+    gridspec_kw=None,
 ):
-    fig = plt.figure(figsize=(4.0, 1.8))
-    gs = fig.add_gridspec(nrows=1, ncols=3, width_ratios=[4.0, 2.3, 0.15], wspace=0.6)
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(
+        nrows=1, ncols=3, width_ratios=[4.0, 2.3, 0.15], wspace=0.6,
+        **(gridspec_kw or {}),
+    )
 
     ax_hm = fig.add_subplot(gs[0, 0])
     show_rgb_heatmap(C_grid, tau_grid, rgb, ax=ax_hm, logC=True, title=title_heatmap)
@@ -454,7 +482,26 @@ def show_contour(
     norm = PowerNorm(gamma=colour_gamma, vmin=np.min(survival), vmax=np.max(survival))
     ax.contourf(survival, origin="lower", extent=extent, levels=levels, cmap="coolwarm", norm=norm)
     cnt = ax.contour(survival, origin="lower", colors="k", extent=extent, levels=levels, norm=norm)
-    ax.clabel(cnt, cnt.levels, inline=True, fontsize=6)
+    # Place contour labels at the midpoint of each line's visible portion
+    # so that no label falls near or outside the axes edges.
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    mx = 0.15 * (xlim[1] - xlim[0])
+    my = 0.15 * (ylim[1] - ylim[0])
+    manual_pts = []
+    for segs in cnt.allsegs:
+        for seg in segs:
+            inside = (
+                (seg[:, 0] >= xlim[0] + mx) & (seg[:, 0] <= xlim[1] - mx)
+                & (seg[:, 1] >= ylim[0] + my) & (seg[:, 1] <= ylim[1] - my)
+            )
+            if inside.any():
+                idx = np.where(inside)[0]
+                mid = idx[len(idx) // 2]
+                manual_pts.append((seg[mid, 0], seg[mid, 1]))
+                break
+    if manual_pts:
+        ax.clabel(cnt, cnt.levels, inline=True, fontsize=6, manual=manual_pts)
 
     if logC:
         lo, hi = C_grid.min(), C_grid.max()

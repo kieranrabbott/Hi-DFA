@@ -80,6 +80,10 @@ def fit_stdp(
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
     lam_hill_constraint: float = 1e6,
+    lam_regime: float = 0.0,
+    lam_reg: float = 1e3,
+    kappa_surv: float = 500.0,
+    lam_surv: float = 1.0,
 ) -> FitResult:
     cfg = (config or FitConfig()).resolved()
     rng = np.random.default_rng(cfg.seed)
@@ -90,9 +94,13 @@ def fit_stdp(
         kappa=kappa,
         lam_pen=lam_pen,
         lam_hill_constraint=lam_hill_constraint,
+        lam_regime=lam_regime,
+        lam_reg=lam_reg,
         rho=rho,
         ages_for_pen=ages_for_pen,
         class_weights=class_weights,
+        kappa_surv=kappa_surv,
+        lam_surv=lam_surv,
     )
 
     x0 = _pack_params(start, keys)
@@ -144,9 +152,13 @@ def _fit_for_k(
     kappa: float,
     lam_pen: float,
     lam_hill_constraint: float,
+    lam_regime: float,
+    lam_reg: float,
     rho: float,
     ages_for_pen,
     class_weights,
+    kappa_surv: float = 500.0,
+    lam_surv: float = 1.0,
 ):
     seed_k = int(config.seed + k)
     config_k = replace(config, seed=seed_k)
@@ -160,9 +172,13 @@ def _fit_for_k(
         kappa=kappa,
         lam_pen=lam_pen,
         lam_hill_constraint=lam_hill_constraint,
+        lam_regime=lam_regime,
+        lam_reg=lam_reg,
         rho=rho,
         ages_for_pen=ages_for_pen,
         class_weights=class_weights,
+        kappa_surv=kappa_surv,
+        lam_surv=lam_surv,
     )
     return k, fit
 
@@ -179,48 +195,47 @@ def fit_over_k_lag(
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
     lam_hill_constraint: float = 1e6,
+    lam_regime: float = 0.0,
+    lam_reg: float = 1e3,
+    kappa_surv: float = 500.0,
+    lam_surv: float = 1.0,
     n_jobs: int = -1,
 ) -> KLagSearchResult:
+    from joblib import Parallel, delayed
+
     cfg = (config or FitConfig()).resolved()
-    keys = DEFAULT_FREE_KEYS if free_keys is None else list(free_keys)
+    keys = list(free_keys) if free_keys is not None else None
 
-    try:
-        from joblib import Parallel, delayed
+    # Filter k_lag out of free_keys (it's set via replace())
+    if keys is not None:
+        keys = [k for k in keys if k != "k_lag"]
 
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(_fit_for_k)(
-                k,
-                data,
-                start,
-                keys,
-                cfg,
-                kappa,
-                lam_pen,
-                lam_hill_constraint,
-                rho,
-                ages_for_pen,
-                class_weights,
-            )
-            for k in k_values
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_fit_for_k)(
+            k=k,
+            data=data,
+            start=start,
+            free_keys=keys,
+            config=cfg,
+            kappa=kappa,
+            lam_pen=lam_pen,
+            lam_hill_constraint=lam_hill_constraint,
+            lam_regime=lam_regime,
+            lam_reg=lam_reg,
+            rho=rho,
+            ages_for_pen=ages_for_pen,
+            class_weights=class_weights,
+            kappa_surv=kappa_surv,
+            lam_surv=lam_surv,
         )
-    except Exception:
-        results = [
-            _fit_for_k(
-                k,
-                data,
-                start,
-                keys,
-                cfg,
-                kappa,
-                lam_pen,
-                lam_hill_constraint,
-                rho,
-                ages_for_pen,
-                class_weights,
-            )
-            for k in k_values
-        ]
+        for k in k_values
+    )
 
-    fit_map = {k: fit for k, fit in results}
-    best_k, best_fit = min(results, key=lambda item: item[1].best_value)
-    return KLagSearchResult(best_k_lag=best_k, best_fit=best_fit, all_fits=fit_map)
+    all_fits = {k: fit for k, fit in results}
+    best_k = min(all_fits, key=lambda k: all_fits[k].best_value)
+
+    return KLagSearchResult(
+        best_k_lag=best_k,
+        best_fit=all_fits[best_k],
+        all_fits=all_fits,
+    )

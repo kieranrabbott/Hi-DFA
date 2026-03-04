@@ -25,9 +25,13 @@ class WorkflowConfig:
     kappa: float = 5000.0
     lam_pen: float = 1e-2
     lam_hill_constraint: float = 1e6
+    lam_regime: float = 1e4
+    lam_reg: float = 1e3
     rho: float = 0.8
     ages_for_pen: tuple[float, ...] = (24.0, 48.0, 72.0)
     class_weights: tuple[float, float, float, float] | None = None
+    kappa_surv: float = 500.0
+    lam_surv: float = 1.0
     auto_style: bool = True
     plot_style: str = "nature"
 
@@ -86,9 +90,13 @@ class ModelWorkflow:
             kappa=self.config.kappa,
             lam_pen=self.config.lam_pen,
             lam_hill_constraint=self.config.lam_hill_constraint,
+            lam_regime=self.config.lam_regime,
+            lam_reg=self.config.lam_reg,
             rho=self.config.rho,
             ages_for_pen=self.config.ages_for_pen,
             class_weights=self.config.class_weights,
+            kappa_surv=self.config.kappa_surv,
+            lam_surv=self.config.lam_surv,
         )
 
         self.fit_result = result
@@ -159,6 +167,7 @@ class ModelWorkflow:
                 kappa=self.config.kappa,
                 lam_pen=self.config.lam_pen,
                 lam_hill_constraint=self.config.lam_hill_constraint,
+                lam_regime=self.config.lam_regime,
                 rho=self.config.rho,
                 ages_for_pen=self.config.ages_for_pen,
                 class_weights=self.config.class_weights,
