@@ -14,6 +14,7 @@ from .objective import (
     _nll_dirichlet,
     _observed_matrix,
     _pack_params,
+    _param_regularization_penalty,
     _pred_matrix,
     _regime_dominance_penalty,
     _survivor_composition_nll,
@@ -40,6 +41,7 @@ def build_objectives(
     lam_pen=1e-2,
     lam_hill_constraint=1e6,
     lam_regime=0.0,
+    lam_reg=1e3,
     rho=0.8,
     ages_for_pen=(24.0, 48.0, 72.0),
     class_weights=None,
@@ -83,7 +85,14 @@ def build_objectives(
         )
 
     def total(z):
-        return nll_only(z) + lam_pen * pen_only(z) + hill_constraint_only(z) + regime_only(z)
+        p = unpack(z)
+        return (
+            nll_only(z)
+            + lam_pen * pen_only(z)
+            + hill_constraint_only(z)
+            + regime_only(z)
+            + lam_reg * _param_regularization_penalty(p)
+        )
 
     return total, nll_only, pen_only, unpack
 
